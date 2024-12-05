@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-computes mp1mp2 using teqc
-kristine larson
-2020sep03 - modified environment variable requirement
-"""
 import argparse
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,10 +12,19 @@ import gnssrefl.gps as g
 
 def vegplt(station, tv,winter):
     """
-    input station name 
-    tv: np array (year, doy, mp1, mp2) 
-    and winter flag for wehther to throw out ~jan-apr
-    and ~oct-dec
+    makes a plot of MP1 multipath metric. Sends to the screen
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+
+    tv: np array 
+        (year, doy, mp1, mp2) 
+
+    winter : bool
+        whether to throw out ~jan-apr and ~oct-dec
+
     """
     if (winter == 'True'):
         cc = ((tv[:,1] > 105) & (tv[:,1] < 274))
@@ -40,8 +43,21 @@ def vegplt(station, tv,winter):
 
 def sfilename(station, year, doy):
     """
-    input station name, year and day of year
-    and it returns the full filename on your local system
+    Finds mp1 filename on your system
+
+    Parameters
+    ----------
+    station : string
+        4 character station name 
+    year : integer
+
+    doy : integer
+        day of year
+
+    Returns
+    -------
+    xfile : string
+        the full SNR filename on your local system
     """
     cdoy = '{:03d}'.format(doy)
     cyyyy = str(year)
@@ -52,12 +68,15 @@ def sfilename(station, year, doy):
 
     return xfile
 
-
-
 def ReadRecAnt(teqclog):
     """
-    input is the name of a teqc log 
-    prints out Receiver and Antenna name
+    prints out Receiver and Antenna name from a teqc log
+
+    Parameters
+    ----------
+    teqclog : str
+        the name of a teqc log 
+
     """
     mp1 = 0
     mp2 = 0
@@ -122,8 +141,21 @@ def readoutmp(teqcfile,rcvtype):
 
 def run_teqc(teqc,navfile,rinexfile,foutname,mpdir):
     """
-    inputs: nav file, rinexfile, and output file name 
-    run teqc and store in the file called foutname
+    run teqcs and stores the output 
+
+    Parameters
+    ----------
+    teqc : str
+        location of the teqc executable
+    navfile : str
+        name of the RINEX nav file
+    rinexfile : string
+        name of the RINEX observation file
+    foutname : str
+        name of the output file
+    mpdir : str
+        location of the multipath directory on your system
+
     """
     line = [teqc, '-nav', navfile, '+qc', rinexfile]
     subprocess.call(line)
@@ -135,9 +167,16 @@ def run_teqc(teqc,navfile,rinexfile,foutname,mpdir):
 
 def check_directories(station,year):
     """
-    inputs: station name and year
     checks that directories exist for teqc logs
-    author: kristine larson
+
+    Parameters
+    ----------
+    station : str
+        4 character station name
+
+    year : int
+        full year
+
     """
     navfiledir = os.environ['ORBITS']  + '/' + str(year)
     if not os.path.isdir(navfiledir):
@@ -164,8 +203,31 @@ def check_directories(station,year):
 
 def get_files(station,year,doy,look):
     """
-    inputs station name, year, and day of year
-    makes sure the files exist etc.
+    Parameters
+    ----------
+    station : str
+        4 character station name
+    year : int
+        full year
+    doy : int
+        day of year
+    look : bool
+        whether you should try to get the file from unavco 
+        if it does not exist locally
+
+    Returns
+    -------
+    navfile : str
+        navigation/orbit file
+    rinexfile : str
+        name of the obs file
+    foutname : str
+        full name of the teqc log output 
+    mpdir :  str
+        directory for MP results
+    goahead : boolean
+        whether you should go ahead and run teqc
+
     """
     goahead = False # means you found everything and can run teqc
 
@@ -215,6 +277,7 @@ def get_files(station,year,doy,look):
 def main():
     """
     computes MP1 MP2 stats using teqc or reads existing log
+
     """
 
     parser = argparse.ArgumentParser()

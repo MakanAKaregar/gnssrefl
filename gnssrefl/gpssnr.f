@@ -20,7 +20,7 @@ c change to 132 characters for inputs
       real*8 c
       parameter (c = 0.299792458D+09)     
 
-      integer stderr
+      integer stderr,iuseful,k
       parameter (stderr=6)
       character*80 inline
       character*4 station
@@ -133,21 +133,36 @@ c     write(stderr,*)'The day of year in your filename: ', rinex_doy
 
 c removed subroutine moving_sites bevacuse life is short
       if ((xrec+yrec+zrec) .eq.0) then
-        mess='ERROR:No (useful) apriori coordinates - exiting'
+        mess='FATAL ERROR:No (useful) apriori coordinates - exiting'
+        write(errid,*)mess
+        mess='Fix the a priori coordinates in your header. '
         write(errid,*)mess
         return
       endif
-      if (iobs(6) .eq. 0) then
-        mess='ERROR:no L1 SNR data - exiting'
+      iuseful = 0
+      do k = 6, 11
+         if (iobs(k) .gt. 0) then
+            iuseful = iuseful + 1
+         endif
+      enddo
+      if (iuseful .eq. 0) then
+        mess='FATAL ERROR:no SNR data were found in your file. This '
         write(errid,*)mess
+        mess='usually this means you need to remake the RINEX file.'
+        write(errid,*)mess
+        mess='Please contact your local RINEX expert for help.'
+        write(errid,*)mess
+
         return
       endif
+
+c     if (iobs(6) .eq. 0) then
+c       return
+c     endif
       if (nobs .gt. 20) then
         mess = 'ERROR: this code only works for <= 20 obs types'
         write(errid,*)mess
-        mess = '1 solution is to to run teqc on the original RINEX'
-        write(errid,*)mess
-        mess = 'with -O.obs S1+S2+S5 as the option, rerun.'
+        mess = 'try using -strip T when running rinex2snr'
         write(errid,*)mess
         return
       endif
@@ -286,7 +301,7 @@ c     fortran write statement
         write(outID,'(i3,  2f10.4, f10.0, 2f7.2, 2f7.2)' )
      .    prn, elev, azimuth, tod, 0.d0,0.d0, s1, s2
 c     all data above 5 degrees
-      elseif ( prn_pick.eq.88 .and.  elev.gt.5 ) then
+      elseif ( prn_pick.eq.88 .and.  elev.gt.0 ) then
         write(outID,'(i3,  2f10.4, f10.0, 2f7.2, 3f7.2)' )
      .    prn, elev, azimuth, tod, x,y, s1, s2,s5
 c     everything < 30
@@ -393,9 +408,30 @@ c       19jan09 changed to allow up to 60 satellites
           read(fileID,'(A80)', iostat=ios) inline
           read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,numsat) 
           read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,numsat)
+        elseif (numsat > 60 .and. numsat <= 72) then
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=13,24)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=13,24)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=25,36)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=25,36)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=37,48)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=37,48)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,60)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,60)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=61,numsat)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=61,numsat)
+
         endif
-        if (numsat > 60) then
-          print*, 'I cannot read more than 60 satellites'
+        if (numsat > 72) then
+          print*, 'I cannot read more than 72 satellites'
           print*, 'Please stop launching them!'
           return
         endif
@@ -546,8 +582,9 @@ c     KL 18mar05, fixed bug on nobs
           read(line, fmt='(I6)') nobs
 c         exit if more than 20 observables
           if (nobs.gt.20) then
-             mess ='ERROR:supports <=20 observ types'
+             mess ='ERROR:this code only supports <=20 observ types'
              write(fid,*) mess
+             write(fid,*) nobs 
              return
           endif
 c   KL 19jan09 allowing more lines of OBS types

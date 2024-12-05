@@ -1,16 +1,33 @@
 # -*- coding: utf-8 -*-
-"""
-computers GPS week (and day of week) from y,m,d
-kristine larson
-Updated: April 3, 2019
-"""
+
 import argparse
 import gnssrefl.gps as g
 
 def main():
+    """
+    Calculates GPS week information and prints it to the screen
+
+    Parameters
+    ----------
+    year : integer
+        full year
+    month : integer
+        calendar month
+    day : integer
+        day of the month
+
+    Returns
+    -------
+    wk : int
+        GPS week
+    dayofthewk : int
+        day of the week (from 0-6) used by the 
+        IGS and others for orbit filenames
+
+    """
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("year", help="year ", type=int)
+    parser.add_argument("year", help="year", type=int)
     parser.add_argument("month", help="month", type=int)
     parser.add_argument("day", help="day", type=int)
 
@@ -20,7 +37,6 @@ def main():
     day = args.day
 
     wk,swk = g.kgpsweek(year, month, day, 0,0,0)
-    #doy,cdoy,cyyyy,cyy = g.ymd2doy(year, month, day )
     print('WEEK:', wk, ' DAY:', int(swk/86400))
 
 

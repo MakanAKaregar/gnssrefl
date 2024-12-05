@@ -41,7 +41,7 @@ c     21feb22 port to python f2py so it can be used in gnssrefl
 
       integer stderr
       parameter (stderr=6)
-      character*80 inline 
+      character*80 inline , mess
       character*4 station
 c     character*2  key(maxsat) 
       character*2 prn_pickc
@@ -60,7 +60,7 @@ c     character*2  key(maxsat)
       integer sp3_gps_weeks(np),sp3_nsat,sp3_satnames(maxsat)
       real*8 sp3_XYZ(maxsat,np,3), sp3_gps_seconds(np),
      .  t9(9), x9(9), y9(9), z9(9), sp3_rel_secs(np)
-      integer ipointer(maxGNSS),errid,itod
+      integer ipointer(maxGNSS),errid,itod, iuseful,k
       logical haveorbit(maxGNSS), debug
       debug = .false.
 c      file id for error log
@@ -119,20 +119,38 @@ c     and an observable array and nobs, number of observables
 
       call read_header_25obs(fileIN,rawfilename, xrec,yrec,zrec,
      .  iobs,nobs,iymd, station,errid)
+      iuseful = 0
+      do k = 6, 11
+         if (iobs(k) .gt. 0) then
+            iuseful = iuseful + 1
+         endif
+      enddo
+      if (iuseful .eq. 0) then
+        mess='FATAL ERROR:no SNR data were found in your file. This '
+        write(errid,*)mess
+        mess='usually this means you need to remake the RINEX file.'
+        write(errid,*)mess
+        mess='Please contact your local RINEX expert for help.'
+        write(errid,*)mess
+
+        return
+      endif 
       if (xrec.eq.0.d0) then
-        write(errid,*) 'you need real station coords '
+        write(errid,*) 'you need non-zero station coords.'
+        write(errid,*) 'Fix the coordinates in your header.'
         return
       endif
       if (zrec.eq.0.d0) then
-        write(errid,*) 'you need real station coords '
+        write(errid,*) 'you need non-zero station coords '
+        write(errid,*) 'Fix the coordinates in your header.'
         return
       endif
 c     print*,'number of obs main code', nobs
 c     moving sites has been removed
       if (nobs .gt. 25 .or. nobs .eq. 0) then
-        write(errid,*) 'Only obs types <= 25 allowed. You'
-        write(errid,*) 'can try using teqc to remove'
-        write(errid,*) 'unneeded observables'
+        write(errid,*) 'Only <= 25 observable types are allowed. '
+        write(errid,*) 'You can try using -strip T when using'
+        write(errid,*) 'rinex2snr or use gfzrnx'
         return
       endif
 
@@ -548,8 +566,8 @@ c     KL 18mar05, fixed bug on nobs
 c         exit if more than 20 observables
           if (nobs.gt.25) then
              write(fid,*)'this code only supports <=25 observ types'
-             write(fid,*)'If your file has more, reduce using teqc '
-             write(fid,*)'teqc -O.obs S1+S2+S5+S6+S8 should work' 
+             write(fid,*)'try using -strip T when using rinex2snr'
+             write(fid,*)'Or you could try using gfzrnx' 
              return
           endif
 c   KL 19jan09 allowing more lines of OBS types
@@ -1193,11 +1211,32 @@ c       19jan09 changed to allow up to 60 satellites
           read(fileID,'(A80)', iostat=ios) inline
           read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,numsat) 
           read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,numsat)
+
+        elseif (numsat > 60 .and. numsat <= 72) then
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=13,24)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=13,24)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=25,36)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=25,36)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=37,48)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=37,48)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,60)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,60)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=61,numsat)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=61,numsat)
         endif
         if (debug) then
 c         print*, 'made it past here'
         endif
-        if (numsat > 60) then
+        if (numsat > 72) then
           print*, 'I cannot read more than 60 satellites'
           print*, 'Please stop launching them!'
           call exit
@@ -1342,7 +1381,7 @@ c      try this ...
         endif
 c         asked for all data > 5
       elseif (prn_pick.eq.88) then
-        if (elev.ge.5) then
+        if (elev.ge.0) then
           write(outID, 112)
      .        prn, elev, az, tod, edot,s6, s1, s2,s5,s7,s8
         endif

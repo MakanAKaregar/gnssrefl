@@ -1,11 +1,12 @@
 """
 written in python from 
 from original TU Vienna codes for GMF
-kristine larson
 """
 import datetime
+import math
 import os
 import pickle
+import subprocess
 import sys
 import wget
 
@@ -17,8 +18,48 @@ import gnssrefl.gps as g
 
 def read_4by5(station, dlat,dlon,hell):
     """
-    author: kristine m. larson
-    input station name (4 char), lat,long,elevation in deg/deg/meters
+    reads existing grid points for a given location
+
+    Parameters
+    ----------
+    station : string
+        name of station
+    dlat : float
+        latitude in degrees
+    dlon : float
+        longitude in degrees
+    hell : float
+        ellipsoidal height in meters
+
+    Returns
+    -------
+    pgrid : 4 by 5 numpy array
+        pressure in hPa
+
+    Tgrid : 4 by 5 numpy array 
+        temperature in C
+
+    Qgrid : 4 by 5 numpy array 
+
+    dTgrid : 4 by 5 numpy array  
+       temperature lapse rate in degrees per km 
+
+    u : 4 by 1 numpy array
+        geoid undulation in meters
+
+    Hs : 4 by 1 numpy array  
+
+    ahgrid : 4 by 5 numpy array
+        hydrostatic mapping function coefficient at zero height (VMF1) 
+
+    awgrid : 4 by 5 numpy array
+        wet mapping function coefficient (VMF1) 
+
+    lagrid : 4 by 5 numpy array
+
+    Tmgrid : 4 by 5 numpy array
+        mean temperature of the water vapor in degrees Kelvin 
+
     requires that an environment variable exists for REFL_CODE
     """
 #
@@ -27,6 +68,7 @@ def read_4by5(station, dlat,dlon,hell):
 #    if not os.path.isdir(inputpath): #if year folder doesn't exist, make it
 #        os.makedirs(inputpath)
 
+    # input file should be written here
     obsfile = inputpath + station + '_refr.txt'
     #print('reading from station refraction file: ', obsfile)
     x = np.genfromtxt(obsfile,comments='%')
@@ -61,25 +103,44 @@ def read_4by5(station, dlat,dlon,hell):
 #
 def gpt2_1w (station, dmjd,dlat,dlon,hell,it):
     """
-    converted by kristine larson from posted TUVienna code
-    input parameters:
-    station: station name
-    dmjd:  modified Julian date (scalar, only one epoch per call is possible)
-    dlat:  ellipsoidal latitude in radians [-pi/2:+pi/2] (vector)
-    dlon:  longitude in radians [-pi:pi] or [0:2pi] (vector)
-    hell:  ellipsoidal height in m (vector)
-    it:    case 1: no time variation but static quantities
-           case 0: with time variation (annual and semiannual terms)
-    output parameters:
-    p:    pressure in hPa
-    T:    temperature in degrees Celsius 
-    dT:   temperature lapse rate in degrees per km 
-    Tm:   mean temperature of the water vapor in degrees Kelvin 
-    e:    water vapor pressure in hPa 
-    ah:   hydrostatic mapping function coefficient at zero height (VMF1) 
-    aw:   wet mapping function coefficient (VMF1) 
-    la:   water vapor decrease factor 
-    undu: geoid undulation in m 
+    Parameters
+    ----------
+    station : str
+        station name
+    dmjd:  float 
+        modified Julian date (scalar, only one epoch per call is possible)
+    dlat : float 
+        ellipsoidal latitude in radians [-pi/2:+pi/2] 
+    dlon : float
+        longitude in radians [-pi:pi] or [0:2pi] 
+    hell : float 
+        ellipsoidal height in m 
+    it: integer
+        case 1: no time variation but static quantities
+
+        case 0: with time variation (annual and semiannual terms)
+
+    Returns
+    -------
+    p : float
+        pressure in hPa
+    T:  float
+        temperature in degrees Celsius 
+    dT : float
+       temperature lapse rate in degrees per km 
+    Tm : float
+        mean temperature of the water vapor in degrees Kelvin 
+    e : float
+        water vapor pressure in hPa 
+    ah: float
+        hydrostatic mapping function coefficient at zero height (VMF1) 
+    aw: float
+        wet mapping function coefficient (VMF1) 
+    la: float
+        water vapor decrease factor 
+    undu: float
+        geoid undulation in m 
+
     """
 
 #  need to find diffpod and difflon
@@ -247,10 +308,18 @@ def gpt2_1w (station, dmjd,dlat,dlon,hell,it):
 def readWrite_gpt2_1w(xdir, station, site_lat, site_lon):
     """
     makes a grid for refraction correction
-    xdir - directory for output
-    station name
-    lat and lon in degrees (NOT RADIANS)
-    kristine m. larson
+
+    Parameters
+    ----------
+    xdir : str
+        directory for output
+    station : str
+        station name, 4 ch
+    lat : float
+        latitude in degrees
+    lon : float 
+        longitude in degrees 
+
     """
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     BASE_DIR = os.path.dirname(PROJECT_ROOT)
@@ -274,41 +343,14 @@ def readWrite_gpt2_1w(xdir, station, site_lat, site_lon):
 
 #   read VMF gridfile in pickle format 
         pname = xdir + '/input/' + 'gpt_1wA.pickle'
-        print('The large refraction file should be stored here:', pname)
-        foundit = False
-        if os.path.isfile(pname):
+        foundit, pname = look_for_pickle_file() 
+        if foundit:
             f = open(pname, 'rb')
             [All_pgrid, All_Tgrid, All_Qgrid, All_dTgrid, All_U, All_Hs, All_ahgrid, All_awgrid, All_lagrid, All_Tmgrid] = pickle.load(f)
             f.close()
-            foundit = True
-        if not foundit:
-            pname =  'gnssrefl/gpt_1wA.pickle'
-            print('2nd attempt: subdirectory gnssrefl of current working directory:', pname)
-            if os.path.isfile(pname):
-                f = open(pname, 'rb')
-                [All_pgrid, All_Tgrid, All_Qgrid, All_dTgrid, All_U, All_Hs, All_ahgrid, All_awgrid, All_lagrid, All_Tmgrid] = pickle.load(f)
-                f.close()
-                foundit = True
-        if not foundit:
-            pname = try3
-            print('3rd attempt try here: ',pname)
-            if os.path.isfile(pname):
-                f = open(pname, 'rb')
-                [All_pgrid, All_Tgrid, All_Qgrid, All_dTgrid, All_U, All_Hs, All_ahgrid, All_awgrid, All_lagrid, All_Tmgrid] = pickle.load(f)
-                f.close()
-                foundit = True
-        if not foundit:
-            print('fourth attempt - download from github')
-            try:
-                pfile = 'gpt_1wA.pickle'
-                url= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/' + pfile
-                wget.download(url,pfile)
-                subprocess.call(['mv','-f',pfile, xdir + '/input/' ])
-                foundit = True
-            except:
-                print('download gpt_1wA.pickle from github and store in REFL_CODE/input')
-                sys.exit()
-
+        else:
+            print('You will need to download gpt_1wA.pickle MANUALLY from github and store it in REFL_CODE/input')
+            sys.exit()
 
 # really should e zero to four, but whatever
         indx = np.zeros(4,dtype=int)
@@ -410,9 +452,21 @@ def readWrite_gpt2_1w(xdir, station, site_lat, site_lon):
 
 def corr_el_angles(el_deg, press, temp):
     """
-    inputs are elevation angles (in degrees)
-    Pressure in hPa and Temperature in degrees C.
-    outputs are corrected elevation angles (in degrees)
+    Corrects elevation angles for refraction using simple angle bending model
+
+    Parameters
+    ----------
+    el_deg : numpy array of floats
+        elevation angles in degrees
+    press : float
+        pressure in hPa
+    temp : float
+        temperature in degrees C
+
+    Returns
+    -------
+    corr_el_deg : numpy array of floats
+        corrected elevation angles (in degrees)
 
     """
 
@@ -423,4 +477,865 @@ def corr_el_angles(el_deg, press, temp):
     corr_el_deg = el_deg + correction   
     return corr_el_deg
 
+
+def look_for_pickle_file():
+    """
+    latest attempt to solve the dilemma of the pickle file needed for
+    the refraction correction
+
+    Returns
+    -------
+    foundit : bool
+        whether pickle file found
+    fullpname : str
+        full path to the pickle file
+    """
+#   read VMF gridfile in pickle format
+
+    pfile = 'gpt_1wA.pickle'
+
+    # at one point i thought this was useful
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(PROJECT_ROOT)
+    try3 = PROJECT_ROOT + '/' + pfile
+    # do i need str??
+    xdir = str(os.environ['REFL_CODE'])
+    inputdir = xdir + '/input/'
+    if os.path.isdir(inputdir):
+        print('found ', inputdir)
+    else:
+        print('make directory: ', inputdir)
+        subprocess.call(['mkdir',inputdir])
+
+    fdir = xdir + '/Files'
+    if not os.path.isdir(fdir):
+        print('make Files directory: ', fdir)
+        subprocess.call(['mkdir', fdir])
+
+    # where the file should be stored
+    fullpname = inputdir + pfile
+
+    print('The large refraction file should be stored here:', fullpname)
+    foundit = False
+
+    if os.path.isfile(fullpname):
+        print('1st attempt: found in ', fullpname)
+        foundit = True
+    else:
+        print('1st attempt: not found in ', fullpname)
+
+    if not foundit:
+        pname =  'gnssrefl/gpt_1wA.pickle'
+        print('2nd attempt: look in subdirectory of current working directory:', pname)
+        if os.path.isfile(pname):
+            subprocess.call(['cp','-f',pname, fullpname  ])
+            foundit = True
+
+    if not foundit:
+        pname = try3
+        print('3rd attempt try looking here: ',pname)
+        if os.path.isfile(pname):
+            foundit = True
+            print('cp it to ', fullpname)
+            subprocess.call(['cp','-f',pname, fullpname])
+        else:
+            print('that did not work')
+
+    url= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/' + pfile
+    if not foundit:
+        print('4th attempt - download from github', url)
+        try:
+            wget.download(url,fullpname)
+        except:
+            print('download or cp failed')
+        if os.path.isfile(fullpname):
+            foundit = True
+
+    if not foundit:
+        url= 'https://morefunwithgps.com/public_html/' + pfile
+        print('5th attempt - ',url)
+        try:
+            wget.download(url,fullpname)
+        except:
+            print('Failed again.')
+
+        if os.path.isfile(fullpname):
+            foundit = True
+        else:
+            print('File should be stored in ', inputdir, ' but is not')
+
+    return foundit , fullpname
+
+
+def Ulich_Bending_Angle(ele, N0,lsp,p,T,ttime,sat):   #UBA
+    """
+    Ulich, B. L. "Millimeter wave radio telescopes: Gain and pointing characteristics." (1981)
+
+    Author: 20220629, fengpeng
+
+    Modified by KL to use numpy so I can use arrays.  I do not know why
+    all these extra input parameters are here.
+
+    Parameters
+    ----------
+    ele : numpy array of floats
+        true elevation angle, degrees
+
+    N0 : float
+        antenna refractivity in ppm
+
+    lsp : dict
+
+    p : float
+        pressure, units?
+
+    T :  float
+        temperature, units?
+
+    ttime : 
+
+    sat : 
+
+    Returns
+    -------
+    De : numpy array of floats
+        corrected elevation angles, deg
+        
+    """
+    e_simple_corr = corr_el_angles(ele, p,T)
+    deg2rad = np.pi/180
+
+    # change to radians
+    ele_rad = deg2rad*(ele)
+    r = N0/1000000.
+    f = np.cos(ele_rad) / (np.sin(ele_rad) + 0.00175 * np.tan(deg2rad*(87.5) - ele_rad))
+    dE = (r * f)/deg2rad
+    #fout = open('ulich.txt', 'w+')
+    #for i in range(0,len(ele)):
+    #    fout.write(" {0:8.5f} {1:8.5f} {2:8.5f} {3:10.0f} {4:5.0f} \n ".format( 
+    #        ele[i], ele[i]+dE[i], e_simple_corr[i], ttime[i], sat[i]))
+    #fout.close()
+
+    return dE + ele
+
+def refrc_Rueger(drypress,vpress,temp):
+    """
+    Obtains refractivity index suitable for GNSS-IR
+
+    Rueger, Jean M. "Refractive index formulae for radio waves." Proceedings of the 
+    FIG XXII International Congress, Washington, DC, USA. Vol. 113. 2002.
+
+    Parameters
+    ----------
+    drypress : float
+        dry pressure hPa
+    vpress : float
+        vapor pressure in hPa
+    temp : float
+        temperature in Kelvin
+
+    Returns 
+    -------
+    ref : list of floats
+         [Ntotal, Nhydro, Nwet], which are total, hydrostatic and wet refractivity in ppm
+
+    """
+
+    # Rueger's "best average", for 375 ppm CO2, 77.690 for 392 ppm CO2
+    [K1r,K2r,K3r]=[77.689 ,71.2952 ,375463.]     
+
+    # Rueger,IAG recommend, in ppm
+    Nrueger = K1r * drypress / temp + K2r * vpress / temp + K3r * vpress / (temp ** 2)  
+
+    # gas constant (SI exact), molar masses of dry air and water, kg/mol
+    [Rgas,Md,Mw] = [8.31446261815324,0.0289644,0.01801528]   
+
+    #density in kg/m^3
+    drydensity=(drypress*100.)*Md/(Rgas*temp)    
+    #in PV=nRT, P in Pa, V in m^3, n in g/mol, T in K, R=8.314 Pa*m^3/(k*mol)
+    vdensity=(vpress*100.)*Mw/(Rgas*temp)   
+    totaldensity=drydensity+vdensity
+
+    #divide by 100 because hPa in Rueger formula, result in ppm
+    Nhydro=(K1r*Rgas*totaldensity/Md)/100.   
+    K2rr=K2r-K1r*(Mw/Md)
+    Nwet=K2rr * vpress / temp + K3r * vpress / (temp ** 2)
+    # in ppm
+    ref=[Nrueger,Nhydro,Nwet]    
+    #ref=[round(Nrueger,4),round(Nhydro,4),round(Nwet,4)]    
+
+    return ref
+
+
+def Equivalent_Angle_Corr_NITE(Hr_apr, e_T, N_ant, ztd_ant, mpf_tot, dmpf_de_tot):
+    """
+
+    This function computes the "equvilent" angular correction to apply the 
+    NITE formula on the true elevation angle ele_eqv = e_T + dele
+
+
+    Equation (24) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    The variable substitude method can be found in Strandberg, J. (2020). 
+    New methods and applications for interferometric GNSS reflectometry. 
+    Chalmers Tekniska Hogskola (Sweden).
+
+    Parameters
+    ----------
+    Hr_apr : float
+        approximate a-priori reflector height, in meters
+    e_T : float
+        satellite true elevation angle in degree
+    N_ant : float
+        atmospheric refractivity at the GNSS antenna, in ppm
+    ztd_ant : float
+        zenith total delay at the antenna, in meters
+    mpf_tot : float
+        total mapping function for this elevation angle
+    dmpf_de_tot : float
+        derivative of the mapping function over elevation angle
+
+    Returns
+    -------
+    dele : float
+        equvilent angular correction in degrees
+
+    """
+    e_A = e_T+Ulich_Bending_Angle_original(e_T, N_ant)
+    sita_E = sita_Earth(Hr_apr, e_A)
+    sita_S = sita_Satellite(Hr_apr, e_A)
+    e_A_r = e_A+sita_E +sita_S
+    Hv_ratio = Hv_Hr_ratio(Hr_apr, 6378137., e_A)
+    sin_eqv_geo = 0.5 * Hv_ratio / np.sin(np.radians(e_A_r + sita_E)) * (1. - np.cos(np.radians(e_T + e_A_r + sita_E)))
+    Nl = N_layer(N_ant, Hr_apr)
+    dsin_up = Hv_ratio*(Nl / 1000000.)/np.sin(np.radians(e_A_r + sita_E))
+    ddele_T_dh = np.tan(np.radians(e_A))
+    dsin_down = Nl / 1000000.*mpf_tot-ztd_ant*(dmpf_de_tot*(1. / (6378137. *ddele_T_dh ))+dmpf_dh(e_T, dhgt=1.))
+    dsin = 0.5*(dsin_up + dsin_down)
+    ele_eqv = np.degrees(np.arcsin(sin_eqv_geo + dsin))
+    dele = ele_eqv - e_T
+
+    return dele
+
+
+def gmf_deriv(dmjd,dlat,dlon,dhgt,zd):
+    """
+    This subroutine determines the Global Mapping Functions GMF  and derivative.
+    Translated from https://vmf.geo.tuwien.ac.at/codes/gmf_deriv.f by Peng Feng in March, 2023.
+
+    Johannes Boehm, 2005 August 30
+    
+    ref 2006 Aug. 14: derivatives (U. Hugentobler)
+    ref 2006 Aug. 14: recursions for Legendre polynomials (O. Montenbruck)
+    ref 2011 Jul. 21: latitude -> ellipsoidal latitude
+
+    Parameters
+    ----------
+    dmjd: float
+        modified julian date
+    dlat: float
+        ellipsoidal latitude in radians
+    dlon: float
+        longitude in radians
+    dhgt: float
+        height in meters
+    zd: float
+        zenith distance in radians ??? ( is this really what you mean??
+        KL: I suspect it is the zenith angle ... in radians
+
+    Returns
+    -------
+    gmfh(2): float
+        hydrostatic mapping function and derivative wrt z
+
+    gmfw(2): float
+        wet mapping function and derivative wrt z
+    
+    """
+
+    ah_mean=[+1.2517e+02, +8.503e-01, +6.936e-02, -6.760e+00, +1.771e-01,
+             +1.130e-02, +5.963e-01, +1.808e-02, +2.801e-03, -1.414e-03,
+             -1.212e+00, +9.300e-02, +3.683e-03, +1.095e-03, +4.671e-05,
+             +3.959e-01, -3.867e-02, +5.413e-03, -5.289e-04, +3.229e-04,
+             +2.067e-05, +3.000e-01, +2.031e-02, +5.900e-03, +4.573e-04,
+             -7.619e-05, +2.327e-06, +3.845e-06, +1.182e-01, +1.158e-02,
+             +5.445e-03, +6.219e-05, +4.204e-06, -2.093e-06, +1.540e-07,
+             -4.280e-08, -4.751e-01, -3.490e-02, +1.758e-03, +4.019e-04,
+             -2.799e-06, -1.287e-06, +5.468e-07, +7.580e-08, -6.300e-09,
+             -1.160e-01, +8.301e-03, +8.771e-04, +9.955e-05, -1.718e-06,
+             -2.012e-06, +1.170e-08, +1.790e-08, -1.300e-09, +1.000e-10]
+
+    bh_mean=[+0.000e+00, +0.000e+00, +3.249e-02, +0.000e+00, +3.324e-02,
+             +1.850e-02, +0.000e+00, -1.115e-01, +2.519e-02, +4.923e-03,
+             +0.000e+00, +2.737e-02, +1.595e-02, -7.332e-04, +1.933e-04,
+             +0.000e+00, -4.796e-02, +6.381e-03, -1.599e-04, -3.685e-04,
+             +1.815e-05, +0.000e+00, +7.033e-02, +2.426e-03, -1.111e-03,
+             -1.357e-04, -7.828e-06, +2.547e-06, +0.000e+00, +5.779e-03,
+             +3.133e-03, -5.312e-04, -2.028e-05, +2.323e-07, -9.100e-08,
+             -1.650e-08, +0.000e+00, +3.688e-02, -8.638e-04, -8.514e-05,
+             -2.828e-05, +5.403e-07, +4.390e-07, +1.350e-08, +1.800e-09,
+             +0.000e+00, -2.736e-02, -2.977e-04, +8.113e-05, +2.329e-07,
+             +8.451e-07, +4.490e-08, -8.100e-09, -1.500e-09, +2.000e-10]
+
+    ah_amp=[ -2.738e-01, -2.837e+00, +1.298e-02, -3.588e-01, +2.413e-02,
+            +3.427e-02, -7.624e-01, +7.272e-02, +2.160e-02, -3.385e-03,
+            +4.424e-01, +3.722e-02, +2.195e-02, -1.503e-03, +2.426e-04,
+            +3.013e-01, +5.762e-02, +1.019e-02, -4.476e-04, +6.790e-05,
+            +3.227e-05, +3.123e-01, -3.535e-02, +4.840e-03, +3.025e-06,
+            -4.363e-05, +2.854e-07, -1.286e-06, -6.725e-01, -3.730e-02,
+            +8.964e-04, +1.399e-04, -3.990e-06, +7.431e-06, -2.796e-07,
+            -1.601e-07, +4.068e-02, -1.352e-02, +7.282e-04, +9.594e-05,
+            +2.070e-06, -9.620e-08, -2.742e-07, -6.370e-08, -6.300e-09,
+            +8.625e-02, -5.971e-03, +4.705e-04, +2.335e-05, +4.226e-06,
+            +2.475e-07, -8.850e-08, -3.600e-08, -2.900e-09, +0.000e+00]
+
+    bh_amp=[+0.000e+00, +0.000e+00, -1.136e-01, +0.000e+00, -1.868e-01,
+            -1.399e-02, +0.000e+00, -1.043e-01, +1.175e-02, -2.240e-03,
+            +0.000e+00, -3.222e-02, +1.333e-02, -2.647e-03, -2.316e-05,
+            +0.000e+00, +5.339e-02, +1.107e-02, -3.116e-03, -1.079e-04,
+            -1.299e-05, +0.000e+00, +4.861e-03, +8.891e-03, -6.448e-04,
+            -1.279e-05, +6.358e-06, -1.417e-07, +0.000e+00, +3.041e-02,
+            +1.150e-03, -8.743e-04, -2.781e-05, +6.367e-07, -1.140e-08,
+            -4.200e-08, +0.000e+00, -2.982e-02, -3.000e-03, +1.394e-05,
+            -3.290e-05, -1.705e-07, +7.440e-08, +2.720e-08, -6.600e-09,
+            +0.000e+00, +1.236e-02, -9.981e-04, -3.792e-05, -1.355e-05,
+            +1.162e-06, -1.789e-07, +1.470e-08, -2.400e-09, -4.000e-10]
+
+    aw_mean=[+5.640e+01, +1.555e+00, -1.011e+00, -3.975e+00, +3.171e-02,
+             +1.065e-01, +6.175e-01, +1.376e-01, +4.229e-02, +3.028e-03,
+             +1.688e+00, -1.692e-01, +5.478e-02, +2.473e-02, +6.059e-04,
+             +2.278e+00, +6.614e-03, -3.505e-04, -6.697e-03, +8.402e-04,
+             +7.033e-04, -3.236e+00, +2.184e-01, -4.611e-02, -1.613e-02,
+             -1.604e-03, +5.420e-05, +7.922e-05, -2.711e-01, -4.406e-01,
+             -3.376e-02, -2.801e-03, -4.090e-04, -2.056e-05, +6.894e-06,
+             +2.317e-06, +1.941e+00, -2.562e-01, +1.598e-02, +5.449e-03,
+             +3.544e-04, +1.148e-05, +7.503e-06, -5.667e-07, -3.660e-08,
+             +8.683e-01, -5.931e-02, -1.864e-03, -1.277e-04, +2.029e-04,
+             +1.269e-05, +1.629e-06, +9.660e-08, -1.015e-07, -5.000e-10]
+
+    bw_mean=[+0.000e+00, +0.000e+00, +2.592e-01, +0.000e+00, +2.974e-02,
+             -5.471e-01, +0.000e+00, -5.926e-01, -1.030e-01, -1.567e-02,
+             +0.000e+00, +1.710e-01, +9.025e-02, +2.689e-02, +2.243e-03,
+             +0.000e+00, +3.439e-01, +2.402e-02, +5.410e-03, +1.601e-03,
+             +9.669e-05, +0.000e+00, +9.502e-02, -3.063e-02, -1.055e-03,
+             -1.067e-04, -1.130e-04, +2.124e-05, +0.000e+00, -3.129e-01,
+             +8.463e-03, +2.253e-04, +7.413e-05, -9.376e-05, -1.606e-06,
+             +2.060e-06, +0.000e+00, +2.739e-01, +1.167e-03, -2.246e-05,
+             -1.287e-04, -2.438e-05, -7.561e-07, +1.158e-06, +4.950e-08,
+             +0.000e+00, -1.344e-01, +5.342e-03, +3.775e-04, -6.756e-05,
+             -1.686e-06, -1.184e-06, +2.768e-07, +2.730e-08, +5.700e-09]
+
+    aw_amp=[+1.023e-01, -2.695e+00, +3.417e-01, -1.405e-01, +3.175e-01,
+            +2.116e-01, +3.536e+00, -1.505e-01, -1.660e-02, +2.967e-02,
+            +3.819e-01, -1.695e-01, -7.444e-02, +7.409e-03, -6.262e-03,
+            -1.836e+00, -1.759e-02, -6.256e-02, -2.371e-03, +7.947e-04,
+            +1.501e-04, -8.603e-01, -1.360e-01, -3.629e-02, -3.706e-03,
+            -2.976e-04, +1.857e-05, +3.021e-05, +2.248e+00, -1.178e-01,
+            +1.255e-02, +1.134e-03, -2.161e-04, -5.817e-06, +8.836e-07,
+            -1.769e-07, +7.313e-01, -1.188e-01, +1.145e-02, +1.011e-03,
+            +1.083e-04, +2.570e-06, -2.140e-06, -5.710e-08, +2.000e-08,
+            -1.632e+00, -6.948e-03, -3.893e-03, +8.592e-04, +7.577e-05,
+            +4.539e-06, -3.852e-07, -2.213e-07, -1.370e-08, +5.800e-09]
+
+    bw_amp=[+0.000e+00, +0.000e+00, -8.865e-02, +0.000e+00, -4.309e-01,
+            +6.340e-02, +0.000e+00, +1.162e-01, +6.176e-02, -4.234e-03,
+            +0.000e+00, +2.530e-01, +4.017e-02, -6.204e-03, +4.977e-03,
+            +0.000e+00, -1.737e-01, -5.638e-03, +1.488e-04, +4.857e-04,
+            -1.809e-04, +0.000e+00, -1.514e-01, -1.685e-02, +5.333e-03,
+            -7.611e-05, +2.394e-05, +8.195e-06, +0.000e+00, +9.326e-02,
+            -1.275e-02, -3.071e-04, +5.374e-05, -3.391e-05, -7.436e-06,
+            +6.747e-07, +0.000e+00, -8.637e-02, -3.807e-03, -6.833e-04,
+            -3.861e-05, -2.268e-05, +1.454e-06, +3.860e-07, -1.068e-07,
+            +0.000e+00, -2.658e-02, -1.947e-03, +7.131e-04, -3.506e-05,
+            +1.885e-07, +5.792e-07, +3.990e-08, +2.000e-08, -5.700e-09]
+
+
+    pi = 3.141592653590000
+
+#   reference day is 28 January
+#   this is taken from Niell (1996) to be consistent
+    doy = dmjd  - 44239.0 + 1 - 28
+
+#   degree n and order m
+    nmax = 9
+    mmax = 9
+
+#   unit vector
+    x = math.cos(dlat)*math.cos(dlon)
+    y = math.cos(dlat)*math.sin(dlon)
+    z = math.sin(dlat)
+  
+# Legendre polynomials (Cunningham)
+
+    V=[[0. for j in range(nmax+1) ] for i in range(nmax+1)]
+    W = [[0. for j in range(mmax + 1)] for i in range(mmax + 1)]
+
+    V[0][0]=1.0
+    W[0][0]=0.0
+    V[1][0]=z*V[0][0]
+    W[1][0]=0.0
+    # print(z)
+
+
+    for n in range(2,nmax+1):
+        V[n][0]=((2*n-1) * z * V[n-1][0] - (n-1) * V[n-2][0])  / n
+        W[n][0]=0.0
+
+
+    for m in range(1,nmax+1):
+        V[m][m] = (2 * m - 1) * (x * V[m - 1][m - 1] - y * W[m - 1][m - 1])
+        W[m][m] = (2 * m - 1) * (x * W[m - 1][m - 1] + y * V[m - 1][m - 1])
+
+        if m<nmax:
+            V[m + 1][m] = (2 * m + 1) * z * V[m][m]
+            W[m + 1][m] = (2 * m + 1) * z * W[m][m]
+        for n in range(m+2,nmax+1):
+            V[n][m] = ((2 * n - 1) * z * V[n-1][m] - (n + m - 1) * V[n-2][m]) / (n - m)
+            W[n][m] = ((2 * n - 1) * z * W[n-1][m] - (n + m - 1) * W[n-2][m]) / (n - m)
+    # print(V)
+    # print(W)
+
+
+    #hydrostatic
+    bh = 0.0029
+    c0h = 0.062
+    if dlat <0.: # southern hemisphere
+        phh = pi
+        c11h = 0.007
+        c10h = 0.002
+    else: # northern hemisphere
+        phh = 0
+        c11h = 0.005
+        c10h = 0.001
+    ch = c0h + ((math.cos(doy / 365.25 * 2. * pi + phh) + 1) * c11h / 2. + c10h) *(1. - math.cos(dlat))
+
+    ahm = 0.
+    aha = 0.
+    i = 0
+    for n in range(0,nmax+1):
+        for m in range(0,n+1):
+            ahm = ahm + (ah_mean[i] * V[n][m] + bh_mean[i] * W[n][m])
+            # print('ahm',i,n,m,ahm,ah_mean[i] , V[n][m] , bh_mean[i],W[n][m])
+            aha = aha + (ah_amp[i] * V[n][m]+ bh_amp[i] * W[n][m])
+            # print('aha', i, n, m, aha, ah_amp[i], V[n][m], bh_amp[i], W[n][m])
+            i=i+1
+    ah=(ahm + aha*math.cos(doy/365.250*2.0*pi))*1.e-5
+    # print('ah',ah,ahm,aha,i)
+    # print(V)
+    # print(W)
+    # print(ah_mean)
+
+
+    # changing this
+    #sine = math.sin(pi / 2 - zd)
+    #cose = math.cos(pi / 2 - zd)
+    #
+    sine = np.sin(pi / 2 - zd)
+    cose = np.cos(pi / 2 - zd)
+    beta = bh / (sine + ch)
+    gamma = ah / (sine + beta)
+    topcon = (1.0 + ah / (1.0 + bh / (1.0 + ch)))
+    gmfh=[0.,0.]
+    gmfh[0] = topcon / (sine + gamma)
+#   derivative
+    gmfh[1] = gmfh[0] ** 2 / topcon * cose * (1 - gamma ** 2 / ah * (1 - beta ** 2 / bh))
+
+#    height correction for hydrostatic mapping function from Niell (1996)
+    a_ht = 2.53e-5
+    b_ht = 5.49e-3
+    c_ht = 1.14e-3
+    hs_km = dhgt / 1000.0
+
+    beta = b_ht / (sine + c_ht)
+    gamma = a_ht / (sine + beta)
+    topcon = (1.0 + a_ht / (1.0 + b_ht / (1.0 + c_ht)))
+    ht_corr_coef = 1 / sine - topcon / (sine + gamma)
+    ht_corr = ht_corr_coef * hs_km
+    gmfh[0] = gmfh[0] + ht_corr
+
+#   derivative
+    gmfh[1]= gmfh[1] + (cose/sine**2 - topcon*cose/(sine+gamma)**2*(1-gamma**2/a_ht*(1-beta**2/b_ht))) * hs_km
+
+
+#   wet
+    bw = 0.00146
+    cw = 0.04391
+    awm = 0.0
+    awa = 0.0
+    i=0
+    for n in range(0,nmax+1):
+        for m in range(0,n+1):
+            awm = awm + (aw_mean[i] * V[n][m] + bw_mean[i] * W[n][m])
+            awa = awa + (aw_amp[i] * V[n][m] + bw_amp[i] * W[n][m])
+            i=i+1
+
+    aw = (awm + awa * math.cos(doy / 365.250 * 2 * pi))*1e-5
+    beta = bw / (sine + cw)
+    gamma = aw / (sine + beta)
+    topcon = (1.0 + aw / (1.0 + bw / (1.0 + cw)))
+
+    gmfw = [0., 0.]
+    gmfw[0] = topcon / (sine + gamma)
+
+#   derivative
+    gmfw[1] = gmfw[0] ** 2 / topcon * cose * (1 - gamma ** 2 / aw * (1 - beta ** 2 / bw))
+
+    return [gmfh[0],gmfh[1],gmfw[0],gmfw[1]]
+
+
+def sita_Earth(Hr, e_A):                                   
+    """
+    This function computes the angular separation of the antenna and the 
+    reflection point in earth surface, view from earth center
+
+    See Equation (7) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    Parameters
+    ----------
+    Hr : float
+        reflector height in meters (height difference between the antenna and the reflecting surface)
+    e_A : float
+        apparent elevation angle at the antenna, in degrees
+
+    Returns
+    -------
+    sita_E : float
+        earth center angle in degrees
+
+    """
+
+    # earth center angle between the reflection point and the GNSS antenna
+    sita_E = Hr / (6378137. * np.tan(np.radians(e_A)))
+    # 
+    #return round(np.degrees(sita_E), 6)                              # in degree
+    return np.degrees(sita_E)                              # in degree
+
+def sita_Satellite(Hr, e_A):                               
+    """
+    This function computes the angle formed by the antenna-satellite line-of-sight 
+    and the reflection point-satellite LoS
+
+    Equation (8) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    Parameters
+    ----------
+    Hr : float
+        reflector height in meters (height difference between the antenna and the reflecting surface)
+    e_A : float
+       apparent elevation angle at the antenna, in degree
+
+    Returns
+    -------
+    sita_S : float
+        satellite angle in degrees (small for MEO satellites)
+
+    """
+
+    ant2satell = 4.*6378137.    # assume satellite distance 4 times earth radius
+    sita_S = 2 * Hr * np.cos(np.radians(e_A)) / ant2satell
+    #return round(np.degrees(sita_S), 6)    # in degree, small for MEO satellites
+    return np.degrees(sita_S)    # in degree, small for MEO satellites
+
+def dH_curve(Hr, Re, e_A):                       
+    """
+    Computes vertical displacement of the reflection point vs. that of a "planar reflection"
+
+    See Equation (7) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    Parameters
+    ----------
+    Hr : float
+        reflector height in meters (height difference between the antenna and the reflecting surface)
+    Re : float
+        (Gaussian) radius of the Earth in meters
+    e_A : float
+       apparent elevation angle at the antenna, in degrees
+
+    Returns
+    -------
+    dH : float
+        vertial displacement of the reflection point in meters
+
+    """
+    dH = Re * (1. - np.cos(Hr / np.tan(np.radians(e_A)) / Re))
+    #return round(dH, 6)    # in meters
+
+    return dH    # in meters
+
+def Hv_Hr_ratio(Hr, Re, e_A):
+    """
+    This function computes the ratio between the "vertical height difference between
+    the antenna and the refection point" and the "reflector height", assuming a 
+    sperical reflector (ocean)
+
+    See equation (23) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    Parameters
+    ----------
+    Hr : float
+        approximate reflector height in meters 
+        (height difference between the antenna and the reflecting surface)
+    Re : float
+        (Gaussian) radius of the Earth in meters
+    e_A : float
+       apparent elevation angle at the antenna, in degree
+
+    Returns
+    -------
+    the_ratio : float
+        ratio, allways bigger than 1
+
+
+    """
+    dH = Re * (1. - np.cos(Hr / np.tan(np.radians(e_A)) / Re))
+    the_ratio = (Hr+dH)/Hr #ratio, allways bigger than 1
+
+    return the_ratio    
+
+def N_layer(N_antenna, Hr):
+    """
+    Computes average refractivity of the top (antenna) and bottom (reflecting surface) of this layer
+
+    See Equation (14) in Peng (2023), DOI: 10.1109/TGRS.2023.3332422
+
+    Parameters
+    ----------
+    N_antenna : float
+        refractivity at the antenna in ppm
+    Hr : float
+        reflector height in meters (height difference between the antenna and the reflecting surface)
+
+    Returns
+    -------
+    Nl : float
+        average refractivity in ppm in this layer
+
+    """
+    Nl = N_antenna *(1+np.exp(Hr/8000.)) /2
+    #return round(Nl, 4)     #in ppm
+    return Nl      #in ppm
+
+
+def saastam2(press, lat, height):
+    """
+    This function computes the Zenith Hydrostatic Delay using the Saastamoinen model 
+    with updated refractivity equation from Rueger (2002)
+
+    Saastamoinen, J. (1972). Atmospheric corrections for the troposphere and 
+    stratosphere in radio ranging of satellites. The Use of Artificial Satellites for 
+    Geodesy, Geophysics Monograph Service, 15, 274-251.
+
+    Feng, P., Li, F., Yan, J., Zhang, F., & Barriot, J. P. (2020). 
+    Assessment of the accuracy of the Saastamoinen model and VMF1/VMF3 mapping functions 
+    with respect to ray-tracing from radiosonde data in the framework of GNSS meteorology. 
+    Remote Sensing, 12(20), 3337.
+
+    Parameters
+    ----------
+    press : float
+        atmospheric total pressure in hPa
+    lat : float
+        latitude of the station, degrees
+    height : float
+        ellipsoidal height of the station in meters 
+
+    Returns
+    -------
+    zhd : float
+        zenith hystostatic delay in meters
+
+    """
+    phi = lat / 180 * 3.14159265359
+    height = height / 1000.
+    f = 1. - 0.0026 * np.cos(2. * phi) - 0.00028 * height
+    # ZHD in meters
+    zhd = 2.2794 * press / f / 1000.                
+
+    return zhd
+
+def mpf_tot(gmf_h, gmf_w, zhd, zwd):  
+    """
+    Finds the total mapping function by weighting the hydrostatic and wet mapping 
+    function with the zenith hydrostatic and wet delay. 
+
+    Author: Peng Feng
+    
+    Parameters
+    ----------
+    gmf_h : float
+        hydrostatic mapping function
+    gmf_w : float
+        wet mapping function
+    zhd : float
+        zenith hydrostatic delay in meters
+    zwd : float
+        zenith wet delay in meters
+
+    Returns
+    -------
+    mpf_tot1 : float
+        total mapping function
+    """
+
+    mpf_tot1=(gmf_h*zhd+gmf_w*zwd)/(zhd+zwd)
+
+    return mpf_tot1
+
+def dmpf_dh(ele, dhgt):    
+    """
+    Station height correction of the hydrostatic mapping function (Niell, 1996)
+    This is translated from Johannes Boehm's vmf1_ht.f Fortran code
+
+    Niell, A. E. (1996). Global mapping functions for the atmosphere delay at
+    radio wavelengths. Journal of geophysical research: solid earth, 101(B2), 3227-3246.
+
+    Boehm, J., Werl, B., & Schuh, H. (2006). Troposphere mapping functions for
+    GPS and very long baseline interferometry from European Centre for Medium‐Range
+    Weather Forecasts operational analysis data. JGR: Solid Earth, 111(B2).
+
+    Parameters
+    ----------
+    ele : float
+        true elevation angle in degree
+    dhgt : float
+        height difference in meters. In GNSS-IR, this is reflector height; 
+        in applying mapping function grid products, this is the height 
+        difference between the antenna and the grid point height
+
+    Returns
+    -------
+    ht_corr : float
+        correction to the hydrostatic mapping function (vmf1h= vmf1h + ht_corr)
+
+    """
+    sine = np.sin(np.radians(ele))
+    [a_ht, b_ht, c_ht] = [0.0000253, 0.00549, 0.00114]
+    hs_km = dhgt / 1000.
+    beta = b_ht / (sine + c_ht)
+    topcon = (1. + a_ht / (1. + b_ht / (1. + c_ht)))
+    ht_corr_coef = 1 / sine - topcon / (sine + a_ht / (sine + beta))
+
+    return ht_corr_coef * hs_km
+
+
+def Ulich_Bending_Angle_original(ele, N0):   
+    """
+    This function computes the atmospheric bending angle with the Ulich equation.
+
+    Equation (18) in Ulich, B. L. (1981). Millimeter wave radio telescopes: 
+    Gain and pointing characteristics. International Journal of Infrared and Millimeter Waves, 2, 293-310.
+
+    Parameters
+    ----------
+    ele : float
+        true elevation angle in degrees
+    N0 : float
+        refractivity in part-per-million
+
+    Returns
+    ----------
+    dele : float
+        bending angle (angular difference between apparent and true elevation angle), in degrees
+
+    """
+    ele = np.radians(ele)
+    r = N0/1000000.
+    f = np.cos(ele) / (np.sin(ele) + 0.00175 * np.tan(np.radians(87.5) - ele))
+
+    return np.degrees(r * f)
+
+
+def Equivalent_Angle_Corr_mpf(ele, mpf_tot, N0, Hr_apr):
+    """
+    This function computes the "equvilent" angular correction to apply the 
+    tropospheric delay calculated with the mapping function.
+
+
+    See: Williams, S. D. P., & Nievinski, F. G. (2017). Tropospheric delays in ground‐based 
+    GNSS multipath reflectometry—Experimental evidence from coastal sites. Journal of Geophysical 
+    Research: Solid Earth, 122(3), 2310-2327.
+
+    Strandberg, J. (2020). New methods and applications for interferometric GNSS 
+    reflectometry. Chalmers Tekniska Hogskola (Sweden).
+
+    Parameters
+    ----------
+    ele : float
+        true elevation angle in degrees
+    mpf_tot : float
+        total mapping function, units?
+    N0 : float
+        refractivity at GNSS antenna in part-per-million
+    Hr_apr : float
+        approximate reflector height in meters
+
+    Returns
+    -------
+    dele : float
+        equvilent angular correction in degrees
+    """
+
+    Nl = N_layer(N0, Hr_apr)
+    dsin_mpf = Nl * mpf_tot / 1000000.  # correction to the sine value
+    ele_eqv = np.degrees(np.arcsin(np.sin(np.radians(ele)) + dsin_mpf))
+    dele = ele_eqv -ele
+
+    return dele
+
+def asknewet(e, Tm, lambda_val):
+    """
+    Determines the zenith wet delay based on the equation 22 by Askne and Nordius (1987)
+
+    Askne and Nordius, Estimation of tropospheric delay for microwaves from surface weather data,
+    Radio Science, Vol 22(3): 379-386, 1987.
+
+    Source: Peng Feng
+   
+    Parameters
+    ----------
+    e : float
+        water vapor pressure in hPa
+    Tm : float
+        mean temperature in Kelvin
+    lambda_val: float
+        water vapor lapse rate (see definition in Askne and Nordius 1987)
+
+    Returns
+    -------
+    zwd :  float
+        zenith wet delay in meter
+
+    """
+
+    #
+    # Example 1:
+    # e =  10.9621 hPa
+    # Tm = 273.8720
+    # lambda_val = 2.8071
+    #
+    # output:
+    # zwd = 0.1176 m
+    # translated from matlab code available at https://vmf.geo.tuwien.ac.at/codes/
+    # Johannes Boehm, 3 August 2013
+    # ---
+
+    # coefficients
+    k1 = 77.604  # K/hPa
+    k2 = 64.79  # K/hPa
+    k2p = k2 - k1 * 18.0152 / 28.9644  # K/hPa
+    k3 = 377600  # KK/hPa
+
+    # mean gravity in m/s**2
+    gm = 9.80665
+    # molar mass of dry air in kg/mol
+    dMtr = 28.965 * 1e-3
+    # universal gas constant in J/K/mol
+    R = 8.3143
+
+    # specific gas constant for dry consituents
+    Rd = R / dMtr
+
+    zwd = 1e-6 * (k2p + k3 / Tm) * Rd / (lambda_val + 1) / gm * e
+
+    return zwd
 

@@ -31,17 +31,19 @@ c     19feb04
 c     allow sp3 files that are longer than 23 hr 45 minutes
 c     21feb22 port to python f2py so it can be used in gnssrefl
 
-      integer maxsat, maxob, maxGNSS, np
+      integer maxsat, maxob, maxGNSS, np, iuseful
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+c     parameter (np= 576)
+c     increased dimension for 3 days of 5 minute data
+      parameter (np= 864)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
-      integer stderr
+      integer stderr, k
       parameter (stderr=6)
-      character*80 inline 
+      character*80 inline , mess
       character*4 station
 c     character*2  key(maxsat) 
       character*2 prn_pickc
@@ -120,22 +122,40 @@ c     and an observable array and nobs, number of observables
       call read_header_25obs(fileIN,rawfilename, xrec,yrec,zrec,
      .  iobs,nobs,iymd, station,errid)
       if (xrec.eq.0.d0) then
-        write(errid,*) 'you need real station coords '
+        write(errid,*) 'You need non-zero station coords '
+        write(errid,*) 'Fix your RINEX file.'
         return
       endif
       if (zrec.eq.0.d0) then
-        write(errid,*) 'you need real station coords '
+        write(errid,*) 'You need non-zero station coords '
+        write(errid,*) 'Fix your RINEX file.'
         return
       endif
 c     print*,'number of obs main code', nobs
 c     moving sites has been removed
       if (nobs .gt. 25 .or. nobs .eq. 0) then
-        write(errid,*) 'Only obs types <= 25 allowed. You'
-        write(errid,*) 'can try using teqc to remove'
-        write(errid,*) 'unneeded observables'
+        write(errid,*) 'Only works with <= 25 obs types.'
+        write(errid,*) 'You can try -strip T in rinex2snr'
+        write(errid,*) 'or use gfzrnx'
         return
       endif
 
+c added error message for people without SNR data in their files ...
+      iuseful = 0
+      do k = 6, 11
+         if (iobs(k) .gt. 0) then
+            iuseful = iuseful + 1
+         endif
+      enddo
+      if (iuseful .eq. 0) then
+        mess='FATAL ERROR:no SNR data were found in your file. This '
+        write(errid,*)mess
+        mess='usually this means you need to remake the RINEX file.'
+        write(errid,*)mess
+        mess='Please contact your local RINEX expert for help.'
+        write(errid,*)mess
+        return
+      endif
 
       call envTrans(xrec,yrec,zrec,staXYZ,Lat,Long,Ht,North,East,Up)
 c     open output file
@@ -277,7 +297,9 @@ c     19mar25 changed filename of sp3 to be really really long
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+c     changed february 12, 2024
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -477,7 +499,8 @@ c             ipointer tells you where it is in the sp3 file
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -515,7 +538,8 @@ c     print*, gps_second, rt
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -661,7 +685,8 @@ c    19feb04 - I am assuming we should use sp3_rel_seconds and relTime now
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -782,7 +807,8 @@ c     kl 2021 feb 24
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
 
       real*8 c 
 
@@ -1088,7 +1114,8 @@ c     returns s1,s2,s5 etc
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -1128,7 +1155,8 @@ c     returns s1,s2,s5 etc
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -1193,12 +1221,34 @@ c       19jan09 changed to allow up to 60 satellites
           read(fileID,'(A80)', iostat=ios) inline
           read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,numsat) 
           read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,numsat)
+
+        elseif (numsat > 60 .and. numsat <= 72) then
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=13,24)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=13,24)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=25,36)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=25,36)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=37,48)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=37,48)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=49,60)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=49,60)
+
+          read(fileID,'(A80)', iostat=ios) inline
+          read(inline(33:80),'(12(A1,I2))') (char, prn(i),i=61,numsat)
+          read(inline(33:80),'(12(A1,2x))') (satID(i),i=61,numsat)
         endif
+
         if (debug) then
 c         print*, 'made it past here'
         endif
-        if (numsat > 60) then
-          print*, 'I cannot read more than 60 satellites'
+        if (numsat > 72) then
+          print*, 'I cannot read more than 72 satellites'
           print*, 'Please stop launching them!'
           call exit
         endif
@@ -1312,7 +1362,8 @@ c     20mar02 added msec to the output, sent from main code
       parameter (maxsat = 200)
       parameter (maxob = 25)
       parameter (maxGNSS = 400)
-      parameter (np= 576)
+      parameter (np= 864)
+c     parameter (np= 576)
       real*8 c 
       parameter (c = 0.299792458D+09)      
 
@@ -1342,7 +1393,7 @@ c      try this ...
         endif
 c         asked for all data > 5
       elseif (prn_pick.eq.88) then
-        if (elev.ge.5) then
+        if (elev.ge.0) then
           write(outID, 112)
      .        prn, elev, az, tod, edot,s6, s1, s2,s5,s7,s8
         endif

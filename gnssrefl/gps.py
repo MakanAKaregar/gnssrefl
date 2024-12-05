@@ -1,17 +1,30 @@
-#!usr/bin/env python
-# -*- coding: utf-8 -*-
-# kristine larson, june 2017
 # toolbox for GPS/GNSS data analysis
 import datetime
 from datetime import date
+from datetime import timedelta
+#from datetime import datetime
+
 import getpass
+import json
 import math
 import os
 import pickle
 import re
+import requests
 import subprocess
 import sys
 import sqlite3
+import zipfile
+from urllib.parse import urlparse
+import time
+from ftplib import FTP #import FTP commands from python's built-in ftp library
+from ftplib import FTP_TLS
+from random import seed
+from random import random
+
+
+# remove for now
+from importlib.metadata import version
 
 import scipy.signal as spectral
 from scipy.interpolate import interp1d
@@ -22,6 +35,12 @@ import wget
 from numpy import array
 
 import gnssrefl.read_snr_files as snr
+import gnssrefl.karnak_libraries as k
+import gnssrefl.gps as g
+import gnssrefl.EGM96 as EGM96
+import gnssrefl.rinex2snr as rnx
+import gnssrefl.sd_libs as sd
+import gnssrefl.kelly as kelly
 
 # for future ref
 #import urllib.request
@@ -57,8 +76,12 @@ class constants:
     bei_L7 = 1207.14
     bei_L6 = 1268.52
     wbL2 = c/(bei_L2*1e6)
+    # these values are defined in Rinex 3 
     wbL7 = c/(bei_L7*1e6)
     wbL6 = c/(bei_L6*1e6)
+    # does this even exist? I am using gps l5 for now
+    bei_L5 = 1176.45
+    wbL5 = c/(bei_L5*1e6)
 
 #   Earth rotation rate used in GPS Nav message
     omegaEarth = 7.2921151467E-5 #	%rad/sec
@@ -73,234 +96,179 @@ class wgs84:
     f  =  1./298.257223563 # flattening factor
     e = np.sqrt(2*f-f**2) # 
 
-def define_filename(station,year,doy,snr):
+def is_it_legal(freq):
     """
-    inputs:
-    station name  (4 char lowercase)
-    year 
-    doy 
-    snr file type (e.g. 99, 66)
-    year doy and snr are integers
-    returns snr filenames (both uncompressed and xz compressed)
-    author: Kristine Larson
-    19mar25: return compressed filename too
-    20apr12: fixed typo in xz name!
+    checks whether the frequency list set by the user in gnssir is legal
+
+    Parameters
+    ----------
+    freq : list of integers
+        frequencies you want to check
+
+    Returns:
+    --------
+    legal : bool
+        whether it is legal or not
     """
-    xdir = os.environ['REFL_CODE'] # main directory for SNR files
+    # currently allowed
+    legal_list = [1,2,20,5,101,102,201,205,206,207,208,302,306,307]
+    # assume legal
+    legal = True
+
+    for f in freq:
+        if f not in legal_list:
+            print('This is not a legal gnssrefl frequency:', f)
+            legal = False
+
+    return legal
+
+def myfavoriteobs():
+    """
+    returns list of SNR obs needed for gfzrnx. 
+
+    """
+    # not even sure why i have C here for beidou
+    # 2023feb02 added L1C - back up to L1 C/A
+    gobblygook = 'G:S1C,S1X,S2X,S2L,S2S,S2X,S5I,S5Q,S5X+R:S1P,S1C,S2P,S2C+E:S1,S5,S6,S7,S8+C:S2C,S7C,S6C,S2I,S7I,S6I,S2X,S6X,S7X'
+    # testing C vs P for glonass
+    #gobblygook = 'G:S1C,S1X,S2X,S2L,S2S,S2X,S5I,S5Q,S5X+R:S1C,S1P,S2C,S2P+E:S1,S5,S6,S7,S8+C:S2C,S7C,S6C,S2I,S7I,S6I,S2X,S6X,S7X'
+
+    return gobblygook
+
+def myfavoritegpsobs():
+    """
+    returns list of GPS only SNR obs needed for gfzrnx. 
+
+    """
+    # can't have non-GPS obs if you ask for only GPS signals 
+    # 2023feb02 added L1C which i believe to be S1X. But c/a still the default
+    gobblygook = 'G:S1C,S1X,S2X,S2L,S2S,S2X,S5I,S5Q,S5X'
+
+    return gobblygook
+
+def ydoych(year,doy):
+    """
+    Converts year and doy to various character strings
+    (two char year, 4 char year, 3 char day of year)
+
+    Parameters
+    ----------
+    year : int
+        full year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    cyyyy : str
+        4 character year
+    cyy : str
+        2 character year
+    cdoy : str
+        3 character day of year
+
+    """
+    cyyyy = str(year)
+    cyy = cyyyy[2:4]
     cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    f= station + str(cdoy) + '0.' + cyy + '.snr' + str(snr)
-    fname = xdir + '/' + str(year) + '/snr/' + station + '/' + f 
-    fname2 = xdir + '/' + str(year) + '/snr/' + station + '/' + f  + '.xz'
-    return fname, fname2
+
+    return cyyyy,cyy,cdoy
+
 
 def define_and_xz_snr(station,year,doy,snr):
     """
-    given station name, year, doy, snr type
-    returns snr filenames and whether it exists
-    if it is xz compressed, it uncompresses it
-    author: Kristine Larson
-    19mar25: return compressed filename too
-    20apr12: fixed typo in xz name! now try to compress here
+    finds and checks for existence of a SNR file
+    uncompresses if that is needed (xz or gz)
+
+    Parameters
+    ----------
+    station: str
+        station name, 4 characters
+    year : int
+        full year
+    doy : int
+        day of year
+    snr : int
+        kind of snr file (66,77, 88 etc)
+
+    Returns
+    -------
+    fname : str
+        full name of the SNR file
+    fname2 : str
+        no longer used but kept for backwards capability
+    snre : bool
+        whether the file exists or not
+
     """
     xdir = os.environ['REFL_CODE']
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    f= station + str(cdoy) + '0.' + cyy + '.snr' + str(snr)
-    fname = xdir + '/' + str(year) + '/snr/' + station + '/' + f
-    fname2 = xdir + '/' + str(year) + '/snr/' + station + '/' + f  + '.xz'
+    cyyyy, cyy, cdoy = ydoych(year,doy)
+    f= station + cdoy + '0.' + cyy + '.snr' + str(snr)
+    fmakan = station.upper() + cdoy + '0.' + cyy + '.snr' + str(snr)
+    fname = xdir + '/' + cyyyy + '/snr/' + station + '/' + f
+    fname2 = xdir + '/' + cyyyy  + '/snr/' + station + '/' + f  + '.xz'
+    fname3 = xdir + '/' + cyyyy  + '/snr/' + station + '/' + f  + '.gz'
+    # for makan
+    fname4 = xdir + '/' + cyyyy  + '/snr/' + station.upper() + '/' + fmakan  
+    # yet another makan option
+    fname5 = xdir + '/' + cyyyy  + '/snr/' + station.upper() + '/' + fmakan   + '.gz'
+
     snre = False
+    # add gzip
     if os.path.isfile(fname):
-        #print('snr file exists')
         snre = True
     else:
         if os.path.isfile(fname2):
-            #print('found xz compressed snr file - try to unxz it')
             subprocess.call(['unxz', fname2])
-        # check that it was success
-            if os.path.isfile(fname):
+        else:
+            if os.path.isfile(fname3):
+                subprocess.call(['gunzip', fname3])
+                fname2 = fname3 #Switch file names for .xz to .gz, for returning proper name below
+        # make sure the uncompression worked
+        if os.path.isfile(fname):
+            snre = True
+        else:
+            #print('did not find lowercase station snr file but will look for uppercase')
+            if os.path.isfile(fname4):
+                print('found uppercase station name in a snr file')
+                fname = fname4
+                fname2 = fname4 # not needed
+            elif os.path.isfile(fname5):
+                print('found gzipped uppercase station name')
+                subprocess.call(['gunzip', fname5])
+                fname = fname4
+                fname2 = fname4 # not needed
                 snre = True
-#   return fname2 but mostly for backwards compatibility
+
+    if not os.path.isfile(fname):
+        print('I looked everywhere for that SNR file and could not find it')
+        print(fname); print(fname2) ; 
+        print(fname3); print(fname4); print(fname5)
+
+#   return fname2 but only for backwards compatibility
     return fname, fname2, snre 
-
-def define_filename_prevday(station,year,doy,snr):
-    """
-    given station name, year, doy, snr file type
-    returns snr filename for the PREVIOUS day
-    fix type for xz
-    author: Kristine Larson
-    """
-    xdir = os.environ['REFL_CODE']
-    year = int(year)
-    doy = int(doy)
-    if (doy == 1):
-        pyear = year -1
-        #print('found january 1, so previous day is december 31')
-        doyx,cdoyx,cyyyy,cyy = ymd2doy(pyear,12,31)
-        pdoy = doyx 
-    else:
-#       doy is decremented by one and year stays the same
-        pdoy = doy - 1
-        pyear = year
-
-    cdoy = '{:03d}'.format(pdoy)
-    cyy = '{:02d}'.format(pyear-2000)
-    f= station + str(cdoy) + '0.' + cyy + '.snr' + str(snr)
-    fname = xdir + '/' + str(year) + '/snr/' + station + '/' + f 
-    fname2 = xdir + '/' + str(year) + '/snr/' + station + '/' + f + '.xz'
-    #print('snr filename for the previous day is ', fname) 
-    return fname, fname2
-
-def read_inputs(station,**kwargs):
-    """
-    given station name, read LSP parameters for strip_snrfile.py
-    author: Kristine M Larson
-    19sep22 change name of longitude variable, add error messages
-    20may20 add peak to noise as an returned variable
-
-    leaving this for now - but it is no longer used.  
-
-    """
-#   directory name is currently defined using REFL_CODE environment variable
-    peak2noise = 0 # assume it is not set here but in the main code,
-    # which is how it used to be
-    xdir = os.environ['REFL_CODE']
-    # this is the old code before I made json inputs
-    fname = xdir + '/input/' + station
-    print('default inputs should be in this file: ', fname)
-#   default location values - not used now
-    lat = 0; lon = 0; h = 0;
-#   counter variables
-    k = 0
-    lc = 0
-#   elevation angle list, degrees
-    elang = []
-#   azimuth angle list, degrees
-    azval = []
-    freqs = [] ; reqAmp = []
-#   this limits the reflector height values you compute LSP for
-    Hlimits = []
-#   default polyfit, elevation angle limits for DC removal
-    polyFit = 3; pele = [5, 30]
-#   desired reflector height precision, in meters
-    desiredP = 0.01
-    ediff = 2
-    noiseRegion = [0.25, 6]
-    default_extension = ''
-    extension = kwargs.get('extension',default_extension)
-    if os.path.exists(fname + '.' + extension):
-        fname = fname + '.' + extension
-        print('extension input file found: ', fname)
-    else:
-        print('use the original input file')
-                
-    try:
-        f = open(fname, 'r')
-#       read all the lines
-        l=f.readlines()
-#       figure out what is on each
-        for line in l:
-#           print(line)
-            if line[0] == '#':
-                lc = lc + 1
-            else:
-                k=k+1
-                nfo=line.split()
-                if k==1:
-# read in the latitude, longitude, and height. currently this information is not used
-                    lat = float(nfo[0])
-                    lon = float(nfo[1])
-                    h = float(nfo[2])
-                    print("latitude/longitude/height:", lat,lon,h)
-# read in the elevation angle ranges
-                if k==2:
-                    elang.append(float(nfo[0]))
-                    elang.append(float(nfo[1]))
-                    print('elevation angle limits', elang[0], elang[1])
-                    # these are elevation angle limits for polyfit
-                    if (len(nfo)==4):
-                        pele = [float(nfo[2]), float(nfo[3]) ]
-# read in the azimuth ranges
-                if k==3:
-                    naz = len(nfo)
-                    for j in range(naz):
-                        azval.append(float(nfo[j]))
-# read in the frequencies and the required spectral amplitudes
-                if k==4:
-                    nnp = int(len(nfo)/2)
-                    for j in range(nnp):
-                        ni = 2*j; nj = 2*j+1
-                        freqs.append(int(nfo[ni]))
-                        reqAmp.append(float(nfo[nj]))
-                        print('Frequency ', int(nfo[ni]), ' Amplitude ', float(nfo[nj]))
-# read in reflector height restrictions etc
-                if k==5:
-                    np = len(nfo)
-                    polyFit = int(nfo[0])
-# this is desired precision of the LSP
-                    desiredP = float(nfo[1])
-                    H1 = Hlimits.append(float(nfo[2]))
-                    H2 = Hlimits.append(float(nfo[3]))
-                    ediff = float(nfo[4])
-                    print('Polynomial Fit ', polyFit, ' Precision: ', desiredP,' ediff ', ediff)
-                    if (np > 5):
-# range of reflector heights used for noise calculation
-                        ns1 = float(nfo[5])
-                        ns2 = float(nfo[6])
-                        noiseRegion = [ns1,ns2]
-                        # this means peak to noise is on the line too
-                        if np > 7:
-                            peak2noise = float(nfo[7])
-                        
-        f.close
-    except:
-        print('Some kind of problem reading the required input file: ' + fname)
-        print('Please use make_input_file.py if it does not exist. It will need at a minimum the ')
-        print('latitude, longitude, and height of the station.  This location does not need to be precise')
-        print('If you do not have your site location handy, just enter 0,0,0.')
-        print('The rest of the inputs can be defaults, but if ')
-        print('your site requires RH > 6 meters, please adjust using -h1 and -h2. Exiting now.')
-        sys.exit()
-
-    return lat,lon,h,elang, azval, freqs, reqAmp,polyFit, desiredP, Hlimits, ediff, pele,noiseRegion, peak2noise
-
-def satclock(week, epoch, prn, closest_ephem):
-    """
-    author: kristine larson, unknown date
-    integer inputs: gps week, second of week, satellite number (PRN)
-    and broadcast ephemeris. 
-    note: although second order correction exists, it is not used  
-
-    returns clock correction in  meters
-    """
-    # what is sent should be the appropriate ephemeris for given
-    # satellite and time
-    prn, week, Toc, Af0, Af1, Af2, IODE, Crs, delta_n, M0, Cuc,\
-    ecc, Cus, sqrta, Toe, Cic, Loa, Cis, incl, Crc, perigee, radot, idot,\
-    l2c, week, l2f, sigma, health, Tgd, IODC, Tob, interval = closest_ephem
-
-    correction = (Af0+Af1*(epoch-Toc))*constants.c
-    return correction[0]
-
-
-def ionofree(L1, L2):
-    """
-    input are L1 and L2 observables (either phase or pseudorange, in meters)
-    output is L3 (meters)
-    author: kristine larson
-    """
-    f1 = constants.fL1
-    f2 = constants.fL2
-    
-    P3 = f1**2/(f1**2-f2**2)*L1-f2**2/(f1**2-f2**2)*L2
-    return P3
 
 def azimuth_angle(RecSat, East, North):
     """
-    kristine larson
-    inputs are receiver satellite vector (meters)
-    east and north unit vectors, computed with the up vector
-    returns azimuth angle in degrees
+    Given cartesian Receiver-Satellite vectors, and East and North
+    unit vectors, computes azimuth angle 
+
+    Parameters
+    ----------
+    RecSat : 3-vector 
+        meters
+
+    East : 3-vector
+        unit vector in east direction
+
+    North : 3-vector 
+        unit vector in north direction
+
+    Returns 
+    -------
+    azangle : float
+        azimuth angle in degrees
+
     """
     staSatE = East[0]*RecSat[0] + East[1]*RecSat[1] + East[2]*RecSat[2]
     staSatN = North[0]*RecSat[0] + North[1]*RecSat[1] + North[2]*RecSat[2]
@@ -313,9 +281,18 @@ def azimuth_angle(RecSat, East, North):
 
 def rot3(vector, angle):
     """
-    input a vector (3) and output the same vector rotated by an angle
-    in radians apparently.
-    original code from ryan hardy
+    Parameters
+    ----------
+    vector : 3 vector
+        float
+    angle : float
+        radians
+
+    Returns
+    -------
+    vector2 : 3 vector
+        float, original vector rotated by angle 
+
     """
     rotmat = np.matrix([[ np.cos(angle), np.sin(angle), 0],
                         [-np.sin(angle), np.cos(angle), 0],
@@ -325,11 +302,27 @@ def rot3(vector, angle):
 
 def xyz2llh(xyz, tol):
     """
-    inputs are station coordinate vector xyz (x,y,z in meters) in a list?, 
-    tolerance for convergence should be small (1E-8)
-    outputs are lat, lon in radians and wgs84 ellipsoidal height in meters
-    author: kristine larson
-    uses wgs84 for Earth parameters
+    Computes latitude, longitude and height from XYZ (meters)
+
+    Parameters
+    ----------
+    xyz : list or np array 
+        X,Y,Z in meters
+
+    tol : float
+        tolerance in meters for the calculation (1E-8 is good enough)
+
+    Returns
+    -------
+    lat : float
+        latitude in radians
+
+    lon : float
+        longitude in radians
+
+    h : float
+        ellipsoidal height in WGS84 in meters
+
     """
     x=xyz[0]
     y=xyz[1]
@@ -341,7 +334,7 @@ def xyz2llh(xyz, tol):
     error = 1
     a2=wgs84.a**2
     i=0 # make sure it doesn't go forever
-    while error > tol and i < 6:
+    while (error > tol) and (i < 6):
         n = a2/np.sqrt(a2*np.cos(lat0)**2+b**2*np.sin(lat0)**2)
         h = p/np.cos(lat0)-n
         lat = np.arctan((z/p)/(1-wgs84.e**2*n/(n+h)))
@@ -352,10 +345,24 @@ def xyz2llh(xyz, tol):
 
 def xyz2llhd(xyz):
     """
-    inputs are station vector xyz (x,y,z in meters), tolerance for convergence is hardwired
-    outputs are lat, lon in degrees and wgs84 ellipsoidal height in meters
-    same as xyz2llh but lat and lon outputs are in degrees
-    author : kristine larson
+    Converts cartesian coordinates to latitude,longitude,height
+
+    Parameters
+    ----------
+    xyz : three vector of floats
+        Cartesian position in meters
+
+    Returns
+    -------
+    lat : float
+        latitude in degrees
+
+    lon : float
+        longitude in degrees
+
+    h : float
+        ellipsoidal height in WGS84 in meters
+
     """
     x=xyz[0]
     y=xyz[1]
@@ -377,14 +384,20 @@ def xyz2llhd(xyz):
         i+=1
     return lat*180/np.pi, lon*180/np.pi, h
 
-
-
 def zenithdelay(h):
     """
-    author: kristine larson
-    input the station ellipsoidal (height) in meters
-    the output is a very simple zenith troposphere delay in meters
+    a very simple zenith troposphere delay in meters
     this is NOT to be used for precise geodetic applications
+
+    Parameters
+    ----------
+    h: float
+        ellipsoidal (height) in meters
+
+    Returns
+    -------
+    zd : float
+        simple zenith delay for the troposphere in meters
 
     """
 
@@ -393,10 +406,25 @@ def zenithdelay(h):
 
 def up(lat,lon):
     """
-    author: kristine larson
-    inputs are latitude and longitude of a station in radians
-    returns the up unit vector, and local east and north unit vectdors needed 
+    returns the up unit vector, and local east and north unit vectors needed 
     for azimuth calc.
+
+    Parameters
+    ----------
+    latitude : float
+        radians
+
+    longitude : float
+        radians
+
+    Returns
+    -------
+    East : three vector
+        local transformation unit vector
+
+    North : three vector
+        local transformation unit vector
+
     """
     xo = np.cos(lat)*np.cos(lon)
     yo = np.cos(lat)*np.sin(lon)
@@ -415,128 +443,57 @@ def up(lat,lon):
 
 def norm(vect):
     """
-    given a three vector - return its norm
+    calculates magnitude of a vector
+
+    Parameters
+    ----------
+    vect : float
+        vector
+
+    Returns
+    -------
+    nv : float
+        norm of vect
+
     """  
     nv = np.sqrt(np.dot(vect,vect))
     return nv
 
 def elev_angle(up, RecSat):
     """
-    inputs:
-    up - unit vector in up direction
-    RecSat is the numpy Cartesian vector that points from receiver 
-    to the satellite in meters
-    the output is elevation angle in radians
-    author: kristine larson
+    computes satellite elevation angle
+
+    Parameters
+    ----------
+    up : 3 vector float 
+        unit vector in the up direction
+
+    RecSat : 3 vector numpy 
+        Cartesian vector pointing from receiver to satellite in meters
+
+    Returns
+    -------
+    angle : float
+        elevation angle in radians
+
     """
     ang = np.arccos(np.dot(RecSat,up) / (norm(RecSat)))
     angle = np.pi/2.0 - ang
     return angle
-
-def sp3_interpolator(t, tow, x0, y0, z0, clock0):
-    """
-    author: originally from ryan hardy  
-    inputs are??? tow is GPS seconds
-    xyz are the precise satellite coordinates (in meters)
-    clocks are likely satellite clock corrections (microseconds)
-    i believe n is the order fit, based on what i recall.
-    these values do not agree with my test cases in matlab or fortran
-    presumably there is an issue with the estimation of the coefficients.
-    they are good enough for calculating an elevation angle used in reflectometry
-    """
-    # ryan set it to 7 - which is not recommended by the paper
-    # ryan confirmed that he doesn't know why this doesn't work ...
-    n = 7 # don't know why this was being sent before
-    coeffs = np.zeros((len(t), 3, n))
-    # whatever ryan was doing was not allowed here.  had to make
-    # sure these are treated as integers
-    s1 = int(-(n-1)/2)
-    s2 = int((n-1)/2+1)
-#    print(s1,s2)
-    
-    omega = 2*2*np.pi/(86164.090530833)
-    x = np.zeros(len(t))
-    y = np.zeros(len(t))
-    z = np.zeros(len(t))
-    clockf = interp1d(tow, clock0, bounds_error=False, fill_value=clock0[-1])
-    clock = clockf(t)
-    # looks like it computes it for a number of t values?
-    for i in range(len(t)):
-        # sets up a matrix with zeros in it - 7 by 7
-        independent = np.matrix(np.zeros((n, n)))
-        # no idea what this does ...
-        m = np.sort(np.argsort(np.abs(tow-t[i]))[:n])
-        tinterp = tow[m]-np.median(tow[m])
-        # set x, y, and z to zeros
-        xr = np.zeros(n)
-        yr = np.zeros(n)
-        zr = np.zeros(n)
-        # coefficients are before and after the time
-        for j in range(s1, s2):
-            independent[j] = np.cos(np.abs(j)*omega*tinterp-(j > 0)*np.pi/2)
-        for j in range(n):
-            xr[j], yr[j], zr[j] = rot3(np.array([x0[m], y0[m], z0[m]]).T[j], omega/2*tinterp[j])
- #           print(j, xr[j], yr[j], zr[j])
-			
-        independent = independent.T
-        eig =  np.linalg.eig(independent)
-        iinv  = (eig[1]*1/eig[0]*np.eye(n)*np.linalg.inv(eig[1]))
-# set up the coefficients
-        coeffs[i, 0] = np.array(iinv*np.matrix(xr).T).T[0]
-        coeffs[i, 1] = np.array(iinv*np.matrix(yr).T).T[0]
-        coeffs[i, 2] = np.array(iinv*np.matrix(zr).T).T[0]
-        
-        j = np.arange(s1, s2)
-        # time since median of the values?
-        tx = (t[i]-np.median(tow[m]))
-        r_inertial =  np.sum(coeffs[i][:, j]*np.cos(np.abs(j)*omega*tx-(j > 0)*np.pi/2), -1)
-
-        x[i], y[i], z[i] = rot3(r_inertial, -omega/2*tx)
-        # returns xyz, in meters ? and satellite clock in microseconds
-        return x*1e3, y*1e3, z*1e3, clock
  
-    
-def readPreciseClock(filename):     
-    """
-    author: kristine larson
-    filename of precise clocks
-    returns prn, time (gps seconds of the week), and clock corrections (in meters)
-    only works for GPS
-    """          
-    StationNFO=open(filename).readlines()
-    c= 299792458 # m/sec
- 
-    nsat = 32 # max number of satellites, for GPS only 
-    k=0
-# this is for 5 second clocks
-    nepochs = 17280
-    prn = np.zeros(nepochs*nsat)
-    t = np.zeros(nepochs*nsat)
-    clockc = np.zeros(nepochs*nsat)
-# reads in the high-rate clock file 
-    for line in StationNFO:
-        if line[0:4] == 'AS G':
-            lines= line[7:60]
-            sat = int(line[4:6])
-            year = int(lines.split()[0])
-            month = int(lines.split()[1])
-            day = int(lines.split()[2])
-            hour = int(lines.split()[3])
-            minutes = int(lines.split()[4])
-            second = float(lines.split()[5])
-            [gw, gpss] = kgpsweek(year, month, day, hour, minutes, second)
-            clock = float(lines.split()[7])
-            prn[k] = sat
-            t[k]=int(gpss)
-            clockc[k]=c*clock
-            k += 1
-    return prn, t, clockc
-
-
 def dec31(year):
     """
-    input: year
-    returns doy of december 31
+    Calculates the day of year for December 31
+
+    Parameters 
+    ----------
+    input: integer
+        year
+
+    Returns 
+    -------
+    doy : integer
+        day of year for December 31
     """
     today=datetime.datetime(year,12,31)
     doy = (today - datetime.datetime(year, 1, 1)).days + 1
@@ -545,413 +502,81 @@ def dec31(year):
 
 def ymd2doy(year,month,day):
     """
-    takes in integer year, month, day 
-    returns day of year (doy)
-    string doy, string year and string (2ch) year
+    Calculates day of year and other date strings
+    
+    Parameters
+    ----------
+    year : integer
+        full year
+
+    month : integer
+        month
+
+    day : integer
+        day of the month
+
+    Returns
+    -------
+    doy : int
+         day of year
+    cdoy : str
+         three character day of year
+    cyyyy : str 
+         four character year
+    cyy : str 
+         two character year
+
     """
     today=datetime.datetime(year,month,day)
     doy = (today - datetime.datetime(today.year, 1, 1)).days + 1
-    cdoy = '{:03d}'.format(doy)
-    cyyyy = '{:04d}'.format(year)
-    cyy = '{:02d}'.format(year-2000)
+    cyyyy, cyy, cdoy = ydoych(year,doy)
     return doy, cdoy, cyyyy, cyy
-
-def rinex_special(station, year, month, day):
-    """
-    author: kristine larson
-    picks up a RINEX file from special unavco area
-    year, month, and day are INTEGERS
-
-    WARNING: only rinex version 2 in this world
-    march25,2021 added gz
-    """
-    exedir = os.environ['EXE']
-    if day == 0:
-        doy = month
-        cyyyy = str(year)
-        cdoy = '{:03d}'.format(doy)
-        cyy = '{:02d}'.format(year-2020)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    unavco= 'ftp://data-out.unavco.org/pub/products/reflectometry/'
-    filenamegz = rinexfile  + '.gz'
-    filename1 = rinexfile 
-    # URL path for the o file 
-    url1 = unavco + cyyyy + '/' + cdoy + '/' + filenamegz
-
-    try:
-        wget.download(url1,filenamegz)
-        status = subprocess.call(['gunzip', filenamegz])
-    except:
-        okokok =1
-
-
-def rinex_unavco_old(station, year, month, day):
-    """
-    author: kristine larson
-    picks up a RINEX file from default unavco area, i.e. not highrate.  
-    it tries to pick up an o file,
-    but if it does not work, it tries the "d" version, which must be
-    decompressed.  the location of this executable is defined in the crnxpath
-    variable. 
-    year, month, and day are INTEGERS
-
-    WARNING: only rinex version 2 in this world
-    21sep01 - this is the old code - changing from ftp to https version
-    (called rinex_unavco)
-    """
-    exedir = os.environ['EXE']
-    crnxpath = hatanaka_version()  # where hatanaka will be
-    if day == 0:
-        doy = month
-        cyyyy = str(year)
-        cdoy = '{:03d}'.format(doy)
-        cyy = '{:02d}'.format(year-2020)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    unavco= 'ftp://data-out.unavco.org'
-    filename1 = rinexfile + '.Z'
-    filename2 = rinexfiled + '.Z'
-    # URL path for the o file and the d file
-    url1 = unavco+ '/pub/rinex/obs/' + cyyyy + '/' + cdoy + '/' + filename1
-    url2 = unavco+ '/pub/rinex/obs/' + cyyyy + '/' + cdoy + '/' + filename2
-
-    #print('try regular RINEX at unavco')
-    try:
-        wget.download(url1,filename1)
-        status = subprocess.call(['uncompress', filename1])
-    # removed to keep jupyter notebooks clean. 
-    #except Exception as err:
-    #    print(err)
-    except:
-        okokok =1
-
-    #print('try hatanaka RINEX at unavco')
-    if not os.path.exists(rinexfile):
-        # look for hatanaka version
-        if os.path.exists(crnxpath):
-            try:
-                wget.download(url2,filename2)
-                status = subprocess.call(['uncompress', filename2])
-                status = subprocess.call([crnxpath, rinexfiled])
-                status = subprocess.call(['rm', '-f', rinexfiled])
-            except:
-                okokok =1
-            #except Exception as err:
-            #    print(err)
-        else:
-            hatanaka_warning()
-
-
-def rinex_sopac(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a hatanaka RINEX file from SOPAC - converts to o
-    can also be called as station, year, doy, 0
-    """
-    if (day == 0):
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-
-    crnxpath = hatanaka_version()
-    if os.path.exists(crnxpath):
-        sopac = 'ftp://garner.ucsd.edu'
-        oname,fname = rinex_name(station, year, month, day) 
-        file1 = fname + '.Z'
-        path1 = '/pub/rinex/' + cyyyy + '/' + cdoy + '/' 
-        url1 = sopac + path1 + file1 
-
-        try:
-            wget.download(url1,file1)
-            subprocess.call(['uncompress', file1])
-            subprocess.call([crnxpath, fname])
-            subprocess.call(['rm', '-f',fname])
-            #print('successful Hatanaka download from SOPAC ')
-        except:
-            #print('Not able to download from SOPAC',file1)
-            subprocess.call(['rm', '-f',file1])
-            subprocess.call(['rm', '-f',fname])
-    else:
-        hatanaka_warning()
-        #print('WARNING WARNING WARNING WARNING')
-        #print('You are trying to convert Hatanaka files without having the proper')
-        #print('executable, CRX2RNX. See links in the gnssrefl documentation')
-
-
-def rinex_sonel(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a hatanaka RINEX file from SOPAC - converts to o
-    hatanaka exe hardwired  for my machine
-    """
-    exedir = os.environ['EXE']
-    crnxpath = hatanaka_version()
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    sonel = 'ftp://ftp.sonel.org'
-    oname,fname = rinex_name(station, year, month, day) 
-    file1 = fname + '.Z'
-    path1 = '/gps/data/' + cyyyy + '/' + cdoy + '/' 
-    url = sonel + path1 + file1 
-
-
-    if os.path.exists(crnxpath):
-        try:
-            wget.download(url,file1)
-            # if successful download, uncompress and translate it 
-            if os.path.exists(file1):
-                subprocess.call(['uncompress', file1])
-                subprocess.call([crnxpath, fname])
-                subprocess.call(['rm', '-f',fname])
-            #print('successful Hatanaka download from SONEL ')
-        except:
-            #print('some kind of problem with Hatanaka download from SONEL',file1)
-            subprocess.call(['rm', '-f',file1])
-    else:
-        hatanaka_warning()
-        #print('WARNING WARNING WARNING WARNING')
-        #print('You are trying to convert Hatanaka files without having the proper')
-        #print('executable, CRX2RNX. See links in the gnssrefl documentation')
 
 def hatanaka_warning():
     """
-    return warning about missing Hatanaka executable
-    author: kristine larson
+    Returns 
+    -------
+    warning about missing Hatanaka executable
+
     """
     print('WARNING WARNING WARNING WARNING')
     print('You are trying to convert Hatanaka files without having the proper')
     print('executable, CRX2RNX. See links in the gnssrefl documentation')
 
-
-def rinex_cddis(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a hatanaka RINEX file from CDDIS - converts to o
-
-    June 2020, changed  to use secure ftp
-    if day is zero, then month is assumed to be doy
-    This is only Rinex version 2 I believe
-    
-    """
-    #print('try to find file at CDDIS')
-    crnxpath = hatanaka_version()
-    if (day == 0):
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-
-    cddis = 'ftp://ftp.cddis.eosdis.nasa.gov'
-    oname,fname = rinex_name(station, year, month, day)
-    file1 = oname + '.Z'
-    url = cddis + '/pub/gnss/data/daily/' + cyyyy + '/' + cdoy + '/' + cyy + 'o/' + file1
-
-    file2 = oname + '.gz'
-    url2 = cddis + '/pub/gnss/data/daily/' + cyyyy + '/' + cdoy + '/' + cyy + 'o/' + file2
-
-    # try new way using secure ftp
-    dir_secure = '/pub/gnss/data/daily/' + cyyyy + '/' + cdoy + '/' + cyy + 'o/'
-    file_secure = file1
-
-    # they say they are going to use gzip - but apparently not yet
-    #print('try the gzip way')
-    #cddis_download(file2,dir_secure)
-    #subprocess.call(['gunzip', file2])
-
-    try:
-        cddis_download(file_secure,dir_secure)
-        if os.path.exists(file1):
-            subprocess.call(['uncompress', file1])
-    except:
-        print('some issue at CDDIS',file1)
-        if os.path.exists(file1):
-            subprocess.call(['rm', '-f',file1])
-    if not (os.path.exists(oname)):
-        try:
-            cddis_download(file2,dir_secure)
-            if os.path.exists(file2):
-                subprocess.call(['gunzip', file2])
-        except:
-            print('some issue at CDDIS ',file2)
-
-    if os.path.exists(oname):
-        okok = 1
-        #print('successful RINEX 2.11 download from CDDIS')
-
-def rinex_nz(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a RINEX file from GNS New zealand
-    you can input day =0 and it will assume month is day of year
-    20jul10 - changed access point and ending
-    21sep02 - chagned from ftp to https
-    """
-    # if doy is input 
-    #print('try to find the file in New Zealand')
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    #gns = 'ftp://ftp.geonet.org.nz/gnss/rinex/'
-    # new access point
-    gns = 'https://data.geonet.org.nz/gnss/rinex/'
-    oname,fname = rinex_name(station, year, month, day)
-    file1 = oname + '.gz'
-    url = gns +  cyyyy + '/' + cdoy +  '/' + file1
-    try:
-        wget.download(url,file1)
-        subprocess.call(['gunzip', file1])
-        #print('successful download from GeoNet New Zealand')
-    except:
-        print('some kind of problem with GeoNet download',file1)
-        subprocess.call(['rm', '-f',file1])
-
-def rinex_bkg(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a lowrate RINEX file BKG
-    you can input day =0 and it will assume month is day of year
-    """
-    crnxpath = hatanaka_version()
-    # if doy is input 
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    gns = 'ftp://igs.bkg.bund.de/EUREF/obs/'
-    #https://igs.bkg.bund.de/root_ftp/IGS/obs/2021/019/
-    # changing to https and gzip
-    # there is also an IGS directory - which I should add
-    gns = 'https://igs.bkg.bund.de/root_ftp/EUREF/obs/'
-
-    oname,fname = rinex_name(station, year, month, day)
-    # they store hatanaka - compression must depend on year 
-    file1 = fname + '.Z'
-    file2 = fname + '.gz'
-    url = gns +  cyyyy + '/' + cdoy +  '/' + file1
-
-    if os.path.exists(crnxpath):
-        print('try unix compression')
-        try:
-            wget.download(url,file1)
-            subprocess.call(['uncompress', file1])
-            subprocess.call([crnxpath, fname])
-            subprocess.call(['rm', '-f',fname])
-        except:
-            print('some kind of problem with BKG download',file1)
-            subprocess.call(['rm', '-f',file1])
-
-        if not os.path.exists(oname):
-            try:
-                url = gns +  cyyyy + '/' + cdoy +  '/' + file2
-                print('try gzip compression')
-                wget.download(url,file2)
-                subprocess.call(['gunzip', file2])
-                subprocess.call([crnxpath, fname])
-                subprocess.call(['rm', '-f',fname])
-            except:
-                print('some kind of problem with BKG download',file1)
-                subprocess.call(['rm', '-f',file2])
-    else:
-        print('You cannot use the BKG archive without installing CRX2RNX.')
-
-
-def rinex_nrcan(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a RINEX file from GNS New zealand
-    you can input day =0 and it will assume month is day of year
-
-    2021june02, use new ftp site.
-    """
-    #exedir = os.environ['EXE']
-    #crnxpath = exedir + '/CRX2RNX'
-    crnxpath = hatanaka_version()
-
-    # if doy is input 
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    # was using this ...
-    gns = 'ftp://gauss.geod.nrcan.gc.ca/data/ftp/naref/pub/rinex/'
-    # user narefftp
-    # password 4NAREF2use
-    gns = 'ftp://gauss.geod.nrcan.gc.ca/data/ftp/naref/pub/data/rinex/'
-    gns = 'ftp://rtopsdata1.geod.nrcan.gc.ca/gps/data/'
-    # 2021 June 2
-    gns = 'ftp://cacsa.nrcan.gc.ca/gps/data/'
-
-    xxdir = gns + 'gpsdata/' + cyy + cdoy  + '/' + cyy + 'd'
-    oname,fname = rinex_name(station, year, month, day)
-    # only hatanaka files in canada and normal unix compression
-    file1 = fname + '.Z'
-    url = xxdir + '/' +  file1
-    print(url)
-#   all nrcan data are in hatanaka format
-    if os.path.exists(crnxpath):
-        try:
-            wget.download(url,file1)
-            subprocess.call(['uncompress', file1])
-            subprocess.call([crnxpath, fname])
-            subprocess.call(['rm', '-f',fname])
-            #print('successful download from NRCAN ')
-        except:
-            print('some kind of problem with NRCAN download',file1)
-            subprocess.call(['rm', '-f',file1])
-    else:
-        print('You cannot use the NRCAN archive without installing CRX2RNX.')
-
 def getnavfile(year, month, day):
     """
-    author: kristine larson
-    given year, month, day it picks up a GPS nav file from SOPAC
-    and stores it in the ORBITS directory
-    returns the name of the file,  its directory, and a boolean
-    19may7 now checks for compressed and uncompressed nav file
-    19may20 now allows day of year input if day is set to zero
-    20apr15 check for xz compression
+    picks up nav file and stores it in the ORBITS directory
 
-    if the day is zero it assumes month is doy
+    Parameters
+    ----------
+    year : int
+        full year
+    month: int
+        if day is zero, the month value is really the day of year
+    day: int
+        day of the month
+
+    Returns
+    -------
+    navname : str
+        name of navigation file
+    navdir : str
+        location of where the nav file should be stored
+    foundit : bool
+        whether the file was found
 
     """
     foundit = False
     ann = make_nav_dirs(year)
-    if (day == 0):
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
     navname,navdir = nav_name(year, month, day)
     nfile = navdir + '/' + navname
     if not os.path.exists(navdir):
         subprocess.call(['mkdir',navdir])
 
-    if os.path.exists(nfile):
-        #print('navfile exists online')
-        foundit = True
-    if (not foundit) and (os.path.exists(nfile + '.xz' )):
-        #print('xz compressed navfile exists online, uncompressing ...')
-        subprocess.call(['unxz',nfile + '.xz'])
-        foundit = True
+    foundit = check_navexistence(year,month,day)
 
-    if not os.path.exists(nfile):
-        #print('go pick up the navfile')
+    if (not foundit):
         navstatus = navfile_retrieve(navname, cyyyy,cyy,cdoy) 
         if navstatus:
             #print('\n navfile being moved to online storage area')
@@ -964,13 +589,24 @@ def getnavfile(year, month, day):
 
 def getsp3file(year,month,day):
     """
-    author: kristine larson
     retrieves IGS sp3 precise orbit file from CDDIS
-    inputs are year, month, and day 
-    modified in 2019 to use wget 
-    returns the name of the file and its directory
 
-    20jun14 - add CDDIS secure ftp
+    Parameters
+    ----------
+    year : integer
+        full year
+    month : integer
+        calendar month
+    day : integer
+        calendar day
+
+    Returns
+    -------
+    name : str
+        filename for the orbits
+    fdir : str
+        directory for the orbits
+
     """
     name, fdir = sp3_name(year,month,day,'igs') 
     cddis = 'ftp://cddis.nasa.gov'
@@ -993,29 +629,42 @@ def getsp3file(year,month,day):
         sec_file = file1
         try:
             #wget.download(url,file1)
-            cddis_download(sec_file, sec_dir) 
+            cddis_download_2022B(sec_file, sec_dir) 
             subprocess.call(['uncompress',file1])
             store_orbitfile(name,year,'sp3') 
         except:
             print('some kind of problem -remove empty file')
             subprocess.call(['rm',file1])
 
-#   return the name of the file so that if you want to store it
     return name, fdir
 
 def getsp3file_flex(year,month,day,pCtr):
     """
-    author: kristine larson
-    retrieves sp3 orbit files from CDDIS
-    inputs are year, month, and day  (integers), and 
-    pCtr, the processing center  (3 characters)
-    returns the name of the file and its directory
-    20apr15 check for xz compression
+    retrieves sp3files
+    only gets the old-style filenames
 
-    20jun14 add CDDIS secure ftp
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        calendar month
+    day : int
+        calendar day 
+    pCtr : str
+        3 character orbit processing center, i.e. gfz
 
-    unfortunately this won't work with the long sp3 file names. use mgex instead
+    Returns
+    -------
+    name : str
+        filename for the orbits
+    fdir : str
+        directory for the orbits
+    fexist : bool
+        whether the orbit file was successfully found
+
     """
+    # really should use mgex version
     # returns name and the directory
     name, fdir = sp3_name(year,month,day,pCtr) 
     #print(name, fdir)
@@ -1029,10 +678,8 @@ def getsp3file_flex(year,month,day,pCtr):
     sec_file = file1
 
     if (os.path.isfile(ofile ) == True):
-        #print('sp3file already exists online')
         foundit = True
     elif (os.path.isfile(ofile + '.xz') == True):
-        #print('xz compressed sp3file already exists online')
         subprocess.call(['unxz', ofile + '.xz'])
         foundit = True
     else:
@@ -1040,49 +687,59 @@ def getsp3file_flex(year,month,day,pCtr):
         cddis = 'ftp://cddis.nasa.gov'
         url = cddis + filename1 
         try:
-            cddis_download(sec_file, sec_dir) 
-            #wget.download(url,file1)
+            cddis_download_2022B(sec_file, sec_dir) 
             subprocess.call(['uncompress',file1])
             store_orbitfile(name,year,'sp3') 
             foundit = True
         except:
             print('some kind of problem-remove empty file, if it exists')
-            subprocess.call(['rm','-f',file1])
-#   return the name of the file so that if you want to store it
+        if os.path.isfile(sec_file):
+            siz = os.path.getsize(sec_file)
+            if (siz == 0):
+                subprocess.call(['rm','-f',sec_file])
+
     return name, fdir, foundit
 
 def getsp3file_mgex(year,month,day,pCtr):
     """
-    author: kristine larson
     retrieves MGEX sp3 orbit files 
-    inputs are year, month, and day  (integers), and 
-    pCtr, the processing center  (3 characters)
-    right now it checks for the "new" name, but in reality, it 
-    assumes you are going to use the GFZ product
-    20apr15  check for xz compression
 
-    20jun14 add CDDIS secure ftp. what a nightmare
-    20jun25 add Shanghai GNSS orbits - as they are available sooner than GFZ
-    20jun25 added French and JAXA orbits
-    20jul01 allow year, doy as input instead of year, month, day
-    20jul10 allow Wuhan, but only one of them.
-    21jan08 obnoxious problem at CDDIS
-    21jan09 CDDIS, again
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month number
+    day : int
+        day of month
+    pCtr : str
+        name of the orbit center, i.e. gfz
+
+    Returns
+    -------
+    name : str
+        orbit filename
+    fdir : str
+        file directory
+    foundit : bool
+        whether orbit file was found
+
     """
+    screenstats = False # for now
     foundit = False
     # this returns sp3 orbit product name
-    if day == 0:
-        print('assume you were given doy in the month input')
-        doy = month
-        year,month,day= ydoy2ymd(year,doy)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
     name, fdir = sp3_name(year,month,day,pCtr) 
+    #print('sp3 filename ',name)
     gps_week = name[3:7]
     igps_week = int(gps_week)
+    # unfortunately the CDDIS archive was at one point computing the GPS week wrong
     igps_week_at_cddis = 1 + int(gps_week)
     #print('GPS week', gps_week,igps_week)
     file1 = name + '.Z'
 
-    # get the sp3 filename for the new format
+    # get the sp3 filename for the new format - which assumes it is gzipped
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
     if pCtr == 'gbm': # GFZ
         file2 = 'GFZ0MGXRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3.gz'
@@ -1091,6 +748,8 @@ def getsp3file_mgex(year,month,day,pCtr):
         #nyear, ndoy = nextdoy(year,doy)
         #cndoy = '{:03d}'.format(ndoy); cnyear = '{:03d}'.format(nyear)
         file2 = 'WUM0MGXULA_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3.gz'
+        file2 = 'WUM0MGXULT_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3.gz'
+        print(file2,screenstats)
     if pCtr == 'grg': # french group
         file2 = 'GRG0MGXFIN_' + cyyyy + cdoy + '0000_01D_15M_ORB.SP3.gz'
     if pCtr == 'sha': # shanghai observatory
@@ -1109,11 +768,13 @@ def getsp3file_mgex(year,month,day,pCtr):
     n1 = os.path.isfile(fdir + '/' + name)
     n1c = os.path.isfile(fdir + '/' + name + '.xz')
     if (n1 == True):
-        #print('first kind of MGEX sp3file already exists online')
+        if screenstats:
+            print('first kind of MGEX sp3file already exists online')
         mgex = 1
         foundit = True
     elif (n1c  == True): 
-        #print('xz first kind of MGEX sp3file already exists online-unxz it')
+        if screenstats:
+            print('xz first kind of MGEX sp3file already exists online-unxz it')
         fx =  fdir + '/' + name + '.xz'
         subprocess.call(['unxz', fx])
         mgex = 1
@@ -1122,10 +783,12 @@ def getsp3file_mgex(year,month,day,pCtr):
     n2 = os.path.isfile(fdir + '/' + name2)
     n2c = os.path.isfile(fdir + '/' + name2 + '.xz')
     if (n2 == True):
-        #print('second kind of MGEX sp3file already exists online')
+        if screenstats:
+            print('MGEX sp3file already exists online')
         mgex = 2 ; foundit = True
     elif (n2c == True):
-        #print('xz second kind of MGEX sp3file already exists online')
+        if screenstats:
+            print('MGEX sp3file already exists online')
         mgex = 2 ; foundit = True
         fx =  fdir + '/' + name2 + '.xz'
         subprocess.call(['unxz', fx])
@@ -1134,86 +797,126 @@ def getsp3file_mgex(year,month,day,pCtr):
         name = name2
     if (mgex == 1):
         name = file1[:-2]
-    #print(mgex, igps_week)
-    if (mgex == 0):
-        # this is to deal with the bug at CDDIS
-        if (igps_week > 2137):
-            name = file2[:-3]
-            # get JAXA orbits from IGN
-            # this is pretty slow, so turning it off
-            #if pCtr == 'jax':
-                #dirlocation_IGN = 'ftp://igs.ensg.ign.fr/pub/igs/products/mgex/' + str(gps_week) + '/'
-                #foundit = ign_orbits(file2, dirlocation_IGN,year)
-            if True:
-            #else:
-                name = file2[:-3]
+
+    #print('Type 1 filename',file1)
+    #print('Type 2 filename',file2)
+
+    if not foundit:
+        if (mgex == 0):
+            if not foundit:
+                name = file2[:-3] 
                 secure_file = file2
-                print('check the correct week everyone uses')
                 secure_dir = '/gps/products/mgex/' + str(igps_week) + '/'
-                #print(secure_dir, secure_file)
                 foundit = orbfile_cddis(name, year, secure_file, secure_dir, file2)
-                if not foundit:
-                    print('use the wrong week at CDDIS')
-                    secure_dir = '/gps/products/mgex/' + str(igps_week_at_cddis) + '/'
-                    foundit = orbfile_cddis(name, year, secure_file, secure_dir, file2)
-        else:
-            secure_dir = '/gps/products/mgex/' + str(gps_week) + '/'
-            secure_file = file1
-            name = file1[:-2]
-            if (igps_week < 2050):
-                #print('old name')
-                try:
-                    cddis_download(secure_file, secure_dir)
-                    if os.path.isfile(file1):
-                        subprocess.call(['uncompress', file1])
-                        store_orbitfile(name,year,'sp3') ; foundit = True
-                except:
-                    okok = 1
-            else:
-                #print('new name')
-                name = file2[:-3]
-                secure_file = file2
-                try:
-                    cddis_download(secure_file, secure_dir)
-                    if os.path.isfile(secure_file):
-                        subprocess.call(['gunzip', file2])
-                        store_orbitfile(name,year,'sp3') ; foundit = True
-                except:
-                    okok = 1
-    #print(name,fdir,foundit)
+            if not foundit:
+                secure_dir = '/gps/products/' + str(igps_week) + '/'
+                foundit = orbfile_cddis(name, year, secure_file, secure_dir, file2)
+            if not foundit:
+                secure_dir = '/gps/products/mgex/' + str(igps_week) + '/'
+                secure_file = file1 # Z compressed
+                name = file1[:-2]
+                foundit = orbfile_cddis(name, year, secure_file, secure_dir, file1)
+            if (not foundit):
+                secure_dir = '/gps/products/' + str(igps_week) + '/'
+                foundit = orbfile_cddis(name, year, secure_file, secure_dir, file2)
+
     return name, fdir, foundit
 
 def orbfile_cddis(name, year, secure_file, secure_dir, file2):
     """
-    tries to download a file from a directory at CDDIS
-    file2 is like this: GFZ0MGXRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3.gz
+    tries to download a file from a directory at CDDIS which 
     it then stores it the year directory (with a given name)
+
+    Parameters
+    ----------
+    name : str
+        the name of the orbit file you want to download from CDDIS
+    year : int
+        full year
+    secure_file : str
+        name of the file at CDDIS
+    secure_dir : str
+        where the file lives at CDDIS
+    file2 : str
+        name without the compression???
+
+    Returns
+    -------
+    foundit : bool
+        whether the file was found
+
+    now checks that file size is not zero. allows old file name downloads
+
     """
+    # assume file was not found
     foundit = False
-    print(secure_dir, secure_file)
+    #print(secure_dir, secure_file)
+    # Z or gz expected ...
+    if secure_file[-3:] == '.gz':
+        gzip = True
+    else:
+        gzip = False
     try:
-        cddis_download(secure_file, secure_dir)
-        if os.path.isfile(secure_file):
-            subprocess.call(['gunzip', file2])
-            store_orbitfile(name,year,'sp3') ; 
-            foundit = True
+        cddis_download_2022B(secure_file, secure_dir)
     except:
         ok = 1
+    # found a file
+    if os.path.isfile(secure_file):
+        siz = os.path.getsize(secure_file)
+        #print('File size', siz)
+        if (siz == 0):
+            subprocess.call(['rm', secure_file])
+        else:
+            foundit = True
+            if gzip:
+                subprocess.call(['gunzip', secure_file])
+                store_orbitfile(name,year,'sp3') ; 
+            else:
+                subprocess.call(['uncompress', secure_file])
+                store_orbitfile(name,year,'sp3') ; 
 
     return foundit
+
 def kgpsweek(year, month, day, hour, minute, second):
     """
-    inputs are year (4 char), month, day, hour, minute, second
-    outputs: gps week and second of the week
-    author: kristine larson
-    modified from a matlab code
+    Calculates GPS week and GPS second of the week
+    There is another version that works on character string.
+    I think (kgpsweekC)
+    
+    Examples
+    --------
+    kgpsweek(2023,1,1,0,0,0)
+        returns 2243  and  0
+
+    Parameters
+    ----------
+    year : int 
+        full year
+    month : int 
+        calendar month
+    day : int 
+        calendar day
+    hour: int
+        hour of the Day (gps time)
+    minute : int 
+        minutes 
+    second : int
+        seconds
+
+    Returns
+    -------
+    GPS_wk : int
+        GPS week
+    GPS_sec_wk : int
+        GPS second of the week
+
     """
 
-    year = np.int(year)
-    M = np.int(month)
-    D = np.int(day)
-    H = np.int(hour)
-    minute = np.int(minute)
+    year = int(year)
+    M = int(month)
+    D = int(day)
+    H = int(hour)
+    minute = int(minute)
     
     UT=H+minute/60.0 + second/3600. 
     if M > 2:
@@ -1225,31 +928,59 @@ def kgpsweek(year, month, day, hour, minute, second):
         
     JD=np.floor(365.25*y) + np.floor(30.6001*(m+1)) + D + (UT/24.0) + 1720981.5
     GPS_wk=np.floor((JD-2444244.5)/7.0);
-    GPS_wk = np.int(GPS_wk)
+    GPS_wk = int(GPS_wk)
     GPS_sec_wk=np.rint( ( ((JD-2444244.5)/7)-GPS_wk)*7*24*3600)            
      
     return GPS_wk, GPS_sec_wk
+
 def kgpsweekC(z):
     """
-    takes in time tag from a RINEX file and converts to gps week/sec
-    so the input is a character string of length 26.  in this 
-    kind of string, the year is only two characters
-    author: kristine larson
+    converts RINEX timetag line into integers/float
+
+    Parameters
+    ----------
+    z : str
+        timetag from rinex file (YY MM DD MM SS.SSSS )
+
+    Returns
+    -------
+    gpsw : integer
+        GPS week
+
+    gpss : integer
+        GPS seconds
+
     """
-    y= np.int(z[1:3])
-    m = np.int(z[4:6])
-    d=np.int(z[7:9])
-    hr=np.int(z[10:12])
-    mi=np.int(z[13:15])
-    sec=np.float(z[16:26])
+    y= int(z[1:3])
+    m = int(z[4:6])
+    d=int(z[7:9])
+    hr=int(z[10:12])
+    mi=int(z[13:15])
+    sec=float(z[16:26])
     gpsw,gpss = kgpsweek(y+2000,m,d,hr,mi,sec)
+
     return gpsw, gpss
 
 def igsname(year,month,day):
     """
-    take in year, month, day
-    returns IGS sp3 filename and COD clockname (5 sec)
-    author: kristine larson
+    returns the name of an IGS orbit file
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month number
+    day : int
+        calendar day number
+
+    Returns
+    -------
+    name : str
+        IGS orbit file name
+    clockname : str
+        COD clockname 
+
     """
     [wk,sec]=kgpsweek(year,month,day,0,0,0)
     x=int(sec/86400)
@@ -1260,16 +991,19 @@ def igsname(year,month,day):
     clockname = 'cod' + dd + '.clk_05s'
 
     return name, clockname
+
 def read_sp3(file):
     """
-    borrowed from Ryan Hardy, who got it from David Wiese
+    borrowed from Ryan Hardy, who got it from David Wiese ... 
+    can't really say more about it
+
     """
     try:      
         f = open(file)
         raw = f.read()
         f.close()
         lines  = raw.splitlines()
-        nprn = np.int(lines[2].split()[1])
+        nprn = int(lines[2].split()[1])
         lines  = raw.splitlines()[22:-1]
         epochs = lines[::(nprn+1)]
         nepoch =  len(lines[::(nprn+1)])
@@ -1280,10 +1014,10 @@ def read_sp3(file):
 				kgpsweek(year, month, day, hour, minute, second)
             for j in range(nprn):
                 prn[i*nprn+j] =  int(lines[i*(nprn+1)+j+1][2:4])
-                x[i*nprn+j] = np.float(lines[i*(nprn+1)+j+1][4:18])
-                y[i*nprn+j] = np.float(lines[i*(nprn+1)+j+1][18:32])
-                z[i*nprn+j] = np.float(lines[i*(nprn+1)+j+1][32:46])
-                clock[i*nprn+j] = np.float(lines[(i)*(nprn+1)+j+1][46:60])
+                x[i*nprn+j] = float(lines[i*(nprn+1)+j+1][4:18])
+                y[i*nprn+j] = float(lines[i*(nprn+1)+j+1][18:32])
+                z[i*nprn+j] = float(lines[i*(nprn+1)+j+1][32:46])
+                clock[i*nprn+j] = float(lines[(i)*(nprn+1)+j+1][46:60])
     except:
         print('sorry - the sp3file does not exist')
         week,tow,x,y,z,prn,clock=[0,0,0,0,0,0,0]
@@ -1292,9 +1026,15 @@ def read_sp3(file):
 
 def myreadnav(file):
     """
-    input is navfile name
+    Reads a GPS nav message. Not currently used in gnssrefl.
+    For historical purposes I am leaving it here.
+
+    Parameters
+    ----------
+    file : str
+        nav filename
+
     output is complicated - broadcast ephemeris blocks
-    author: Kristine Larson, April 2017
     """
 # input is the nav file
     try:
@@ -1325,20 +1065,20 @@ def myreadnav(file):
                     week, Toc = kgpsweek(year, month, day, hour, minute, second)
                     table[i, 1] =  week
                     table[i, 2] = Toc
-                    Af0 = np.float(lines[i*8][-3*19:-2*19].replace('D', 'E'))
-                    Af1 = np.float(lines[i*8][-2*19:-1*19].replace('D', 'E'))
-                    Af2 = np.float(lines[i*8][-19:].replace('D', 'E'))
+                    Af0 = float(lines[i*8][-3*19:-2*19].replace('D', 'E'))
+                    Af1 = float(lines[i*8][-2*19:-1*19].replace('D', 'E'))
+                    Af2 = float(lines[i*8][-19:].replace('D', 'E'))
                     table[i,3:6] = Af0, Af1, Af2
                 elif j != 7:
                     for k in range(4):
-                        value = np.float(lines[i*8+j][19*k+3:19*(k+1)+3].replace('D', 'E'))
+                        value = float(lines[i*8+j][19*k+3:19*(k+1)+3].replace('D', 'E'))
                         table[i,2+4*j+k] = value
                 elif j== 7:
-                    table[i,-2]= np.float(lines[i*8+j][3:19+3].replace('D', 'E'))
+                    table[i,-2]= float(lines[i*8+j][3:19+3].replace('D', 'E'))
                     if not lines[i*8+7][22:].replace('D', 'E').isalpha():
                         table[i,-1]= 0
                     else:
-                        table[i, -1] = np.float(lines[i*8+7][22:41].replace('D', 'E'))
+                        table[i, -1] = float(lines[i*8+7][22:41].replace('D', 'E'))
 # output is stored as:
 #
 # 0-10   prn, week, Toc, Af0, Af1, Af2, IODE, Crs, delta_n, M0, Cuc,\
@@ -1352,13 +1092,13 @@ def myreadnav(file):
         #print('This ephemeris file does not exist',file)
         ephem = []
     return ephem
+
 def myfindephem(week, sweek, ephem, prn):
     """
 # inputs are gps week, seconds of week
 # ephemerides and PRN number
 # returns the closest ephemeris block after the epoch
 # if one does not exist, returns the first one    
-    author: kristine larson
 """
     t = week*86400*7+sweek
 # defines the TOE in all the ephemeris 
@@ -1387,10 +1127,22 @@ def myfindephem(week, sweek, ephem, prn):
 
 def findConstell(cc):
     """
-    input is one character (from rinex satellite line)
-    output is integer added to the satellite number
-    0 for GPS, 100 for Glonass, 200 for Galileo, 300 for everything else?
-    author: kristine larson, GFZ, April 2017
+    determine constellation integer value 
+
+    Parameters
+    -----------
+    cc : string  is one character (from rinex satellite line)
+        constellation definition:
+            G : GPS
+            R : Glonass
+            E : Galileo
+            C : Beidou
+
+    Returns
+    -------
+    out : integer
+        value added to satellite number for our system,
+        0 for GPS, 100 for Glonass, 200 for Galileo, 300 for everything else
     """
     if (cc == 'G' or cc == ' '):
         out = 0
@@ -1402,6 +1154,7 @@ def findConstell(cc):
         out = 300
         
     return out
+
 def myscan(rinexfile):
     """
     stripping the header code came from pyrinex.  
@@ -1498,20 +1251,20 @@ def myscan(rinexfile):
                         gg = d*16
                         f=lines[i+1+2*k][gg:gg+14]
                         if not(f == '' or f.isspace()):
-                            val = np.float(lines[i+1+2*k][gg:gg+14])
+                            val = float(lines[i+1+2*k][gg:gg+14])
                             table[l+k, 3+d] = val
                     for d in range(numobs-5):
                         gg = d*16
                         f=lines[i+2+2*k][gg:gg+14]
                         if not (f == '' or f.isspace()):
-                            val = np.float(lines[i+2+2*k][gg:gg+14])
+                            val = float(lines[i+2+2*k][gg:gg+14])
                             table[l+k, 3+5+d] = val
                 else:
                     for d in range(numobs):
                         gg = d*16
                         f = lines[i+1+2*k][gg:gg+14]
                         if (f == '' or f.isspace()):
-                            val = np.float(lines[i+2+2*k][gg:gg+14])
+                            val = float(lines[i+2+2*k][gg:gg+14])
                             table[l+k, 3+d] = val
 
             i+=numsvs*int(np.ceil(header['# / TYPES OF OBSERV'][0]/5))+1
@@ -1535,43 +1288,6 @@ def myscan(rinexfile):
     obs =  dict(zip(tuple(newheader.split('\t')), table.T))
     return obs,x,y,z
 
-def geometric_rangePO(secweek, prn, rrec0, sweek, ssec, sprn, sx, sy, sz, sclock):
-    """
-    Calculates and returns geometric range (in metres) given
-    time (week and sec of week), prn, Cartesisan 
-    receiver coordinates rrec0(meters)
-    using the precise ephemeris instead of the broadcast
-    returns clock correction (clockC) in meters
-    Author: Kristine Larson, May 2017
-    June 21, 2017 returns transmit time (in seconds) so I can calculate
-    relatistic correction
-    """
-    error = 1
-    # find the correct sp3 data for prn
-    m = [sprn==prn]
-    nx,ny,nz,nc = sp3_interpolator(secweek, ssec[m], sx[m], sy[m], sz[m], sclock[m]) 
-    SatOrb = np.array([nx[0],ny[0],nz[0]])
-    geo=norm(SatOrb-rrec0)
-    c=constants.c
-    clockC = nc*1e-6*c
-    oE = constants.omegaEarth
-    deltaT = norm(SatOrb - rrec0)/constants.c
-    ij=0
-    while error > 1e-16:  
-        nx,ny,nz,nc = sp3_interpolator(secweek-deltaT, ssec[m], sx[m], sy[m], sz[m], sclock[m]) 
-        SatOrb = np.array([nx[0],ny[0],nz[0]])
-#        SatOrb, relcorr = propagate(week, secweek-deltaT, closest_ephem)
-        Th = -oE * deltaT
-        xs = SatOrb[0]*np.cos(Th)-SatOrb[1]*np.sin(Th)
-        ys = SatOrb[0]*np.sin(Th)+SatOrb[1]*np.cos(Th)
-        SatOrbn = [xs, ys, SatOrb[2]]
-        geo=norm(SatOrbn-rrec0)
-        deltaT_new = norm(SatOrbn-rrec0)/constants.c               
-        error = np.abs(deltaT - deltaT_new)
-        deltaT = deltaT_new
-        ij+=1
-    #    print(ij)
-    return geo,SatOrbn,clockC, deltaT
 def read_files(year,month,day,station):
     """
     """   
@@ -1643,44 +1359,6 @@ def read_files(year,month,day,station):
         f.close()
         
     return ephemdata, prns, ts, clks, sweek, ssec, sprn, sx, sy,sz,sclock,obs,x,y,z
-def precise_clock(prn,prns,ts,clks,gps_seconds):
-    """
-    input prn and gps_seconds, and contents of precise clock file,
-    i think.
-    units of returned variable are?
-    """
-    m = [prns == prn]
-    preciset = ts[m]
-    precisec = clks[m]
-#           # trying to interpolate
-# could do this much faster ...
-    clockf = interp1d(preciset, precisec, bounds_error=False)
-    scprecise = clockf(gps_seconds)
-    return scprecise
-def precise_clock_test(ttags, prns,ts,clks):
-    """
-    input timetags (gps seconds of the week)
-    and precise clock values.returns interpolated values
-    units of returned variable are?
-    """
-    NP = len(ttags)
-    print('number of time tags', NP)
-    newclks = np.zeros((NP, 32))
-    for i in range(32): 
-        prn = i+1
- #        print('checking', prn)
-        m = [prns == prn]
-        [nr,nc]=np.shape(m)
- #       print(nr,nc)
-        preciset = ts[m]
-        precisec = clks[m]
-        clockf = interp1d(preciset, precisec, bounds_error=False)
-        k=0
-        for t in ttags:
-            newclks[k,i]= clockf(t)
-            k +=1
-#        print(prn, numrows, numcols)
-    return newclks
 
 def propagate(week, sec_of_week, ephem):
     """
@@ -1689,7 +1367,6 @@ def propagate(week, sec_of_week, ephem):
     returns the x,y,z, coordinates of the satellite 
     and relativity correction (also in meters), so you add,
     not subtract
-    Kristine Larson, April 2017
 
     """
 
@@ -1736,373 +1413,37 @@ def propagate(week, sec_of_week, ephem):
 #    return [xk, yk, zk], relcorr
     return [xk[0], yk[0], zk[0]], relcorr
 
-def mygeometric_range(week, secweek, prn, rrec0, closest_ephem):
-    """
-    Calculates and returns geometric range (in metres) given
-    time (week and sec of week), prn, receiver coordinates (cartesian, meters)
-    this assumes someone was nice enough to send you the closest ephemeris
-    returns the satellite coordinates as well, so you can use htem
-    in the A matrix
-    Kristine Larson, April 2017
-    """
-    error = 1
-
-    SatOrb, relcorr = propagate(week, secweek, closest_ephem)
-    # first estimate of the geometric range
-    geo=norm(SatOrb-rrec0)
-
-    deltaT = norm(SatOrb - rrec0)/constants.c
-    while error > 1e-16:     
-        SatOrb, relcorr = propagate(week, secweek-deltaT, closest_ephem)
-        Th = -constants.omegaEarth * deltaT
-        xs = SatOrb[0]*np.cos(Th)-SatOrb[1]*np.sin(Th)
-        ys = SatOrb[0]*np.sin(Th)+SatOrb[1]*np.cos(Th)
-        SatOrbn = [xs, ys, SatOrb[2]]
-        geo=norm(SatOrbn-rrec0)
-        deltaT_new = norm(SatOrbn-rrec0)/constants.c               
-        error = np.abs(deltaT - deltaT_new)
-        deltaT = deltaT_new
-    return geo,SatOrbn
-
-
-def readobs(file,nepochX):
-    """
-    inputs: filename and number of epochs from the RINEX file you want to unpack
-    returns: receiver Cartesian coordinates (meters) and observation blocks
-    Kristine Larson, April 2017
-    18aug20: updated so that 0,0,0 is returned if there are no receiver coordinates
-    """
-    f = open(file, 'r')
-    obs = f.read()
-    f.close()
-    testV = obs.split('APPROX POSITION XYZ')[0].split('\n')[-1].split()
-#   set default receiver location values,              
-    x0=0
-    y0=0
-    z0=0
-    if len(testV) == 3:
-        x0, y0, z0 = np.array(obs.split('APPROX POSITION XYZ')[0].split('\n')[-1].split(), 
-    
-							dtype=float)
-    types = obs.split('# / TYPES OF OBSERV')[0].split('\n')[-1].split()[1:]
-    print(types)
-    tfirst =  obs.split('TIME OF FIRST OBS')[0].split('\n')[-1].split()
-    print(tfirst)
-    ntypes = len(types)
-	#Identify unique epochs
-    countstr = '\n '+tfirst[0][2:]+' '+'%2i' % np.int(tfirst[1])+' '+'%2i' % np.int(tfirst[2])
-    print(countstr) # so this is 07 10 13, e.g.
-    # figures out how many times this string appears between END OF HEADER and end of file
-    nepoch = obs.split('END OF HEADER')[1].count(countstr)
-    
-    table = np.zeros((0, ntypes+3))
-	#Identify kinds of observations in the file
-    header = 'PRN\tWEEK\tTOW'
-    t0 = 0
-    for i in range(ntypes):
-        header += '\t'+types[i]
-    l = 0
-#    print('countstr',countstr[0])
-    print('header', header)
-    epochstr_master = re.split(countstr, obs)
-    print('number of data epochs in the file', nepoch)
-    # only unpack a limited number of epochs    #nepoch = 5
-    print('restricted number of epochs to be read ', nepochX)
-    for i in range(nepochX):
-        epochstr = epochstr_master[i+1]        
-        # this will only work with new rinex files that use G as descriptor
-# this only finds GPS!
-        prnstr = re.findall(r'G\d\d|G \d', epochstr.split('\n')[0])
-        print(prnstr)
-#        print('prnstr', prnstr)
-        # number of satellites for an observation block
-        # this code won't work if there are more than 12 satellites (i think)
-        nprn = len(prnstr)
-        # append
-        table = np.append(table, np.zeros((nprn, ntypes+3)), axis=0)
-        # decode year, month, day hour, minute ,second
-        # convert 2 char to 4 char year
-        # but it appears that the year nad month and day 
-        # are being hardwired from the header, which is both  very very odd
-        # and stupid
-        year = int(tfirst[0])
-        month = int(tfirst[1])
-        day = int(tfirst[2])
-        hour = int(epochstr.split()[0])
-        minute = int(epochstr.split()[1])
-        second = float(epochstr.split()[2])
-        print(year, month, day, hour, minute, second)
-        week, tow = kgpsweek(year, month, day, hour, minute, second)
-        print('reading week number ', week, 'sec of week', tow)
-        table[l:l+nprn, 1] = week
-        table[l:l+nprn,2] = tow
-        for j in range(nprn):
-            table[l+j, 0] = np.int(prnstr[j][1:])
-            # split up by end of line markers, which makes sense
-#            print('something',2*j+1)
-            line0 = epochstr.split('\n')[2*j+1]#.split()
-            line = re.findall('.{%s}' % 16, line0+' '*(80-len(line0)))
-# this seems to get strings of a certain width, which he will later change 
-#through float# also where he made his mistake on reading last two characters 
-#            print(j,len(line), line)
-
-            for k in range(len(line)):
-                if line[k].isspace():
-                    table[l+j, 3+k] = np.nan
-                    continue
-                table[l+j, 3+k] = np.float(line[k][:-2])
-#                print(table[l+j,3+k])
-                # if more than 5 observaitons, he has to read the next line
-            if ntypes > 5:
-                line2 = epochstr.split('\n')[2*j+2].split()
-#                print(line2)
-                for k in range(len(line2)):
-                    table[l+j, 3+len(line)+k] = np.float(line2[k][:-2])
-        l += nprn	
-    format = tuple(np.concatenate((('%02i', '%4i', '%11.7f'), 
-							((0, ntypes+3)[-1]-3)*['%14.3f'])))
-    # kinda strange - but ok - format statemenst for PRN, week, sec of week, etc
-#    print(format)
-# I guess it is making a super observable so that it can later be parsed.
-# very strange 
-    obs =  dict(zip(tuple(header.split('\t')), table.T))
-
-    return np.array([x0,y0,z0]),obs
-
-def tmpsoln(navfilename,obsfilename):
-    """
-    kristine larson
-    inputs are navfile and obsfile names
-    should compute a pseudorange solution
-    """
-    r2d = 180.0/np.pi
-#  elevation mask
-    emask = 10 
- 
-    ephemdata = myreadnav(navfilename)
-    if len(ephemdata) == 0:
-        print("empty ephmeris or does not exist")
-        return
-    #cartesian coordinates - from the header
-    # number of epochs you want to read
-    nep = 2
-    recv,obs=readobs2(obsfilename,nep)
-    print('A priori receiver coordinates', recv)
-    if recv[0] == 0.0:
-        print('using new a priori')
-        recv[0]=-2715532
-        recv[1] = -881995
-        recv[2] = 5684286
-        print('now using', recv)
-    lat, lon, h = xyz2llh(recv,1e-8)
-    print("%15.7f %15.7f"% (lat*r2d,  lon*r2d) )
-    # zenith delay - meters
-    zd = zenithdelay(h)
-    u,east,north = up(lat,lon)
-    epoch = np.unique(obs['TOW'])
-    NN=len(epoch)
-    NN = 2 # only do two positions
-    for j in range(NN):
-        print('Epoch', j+1)
-        sats = obs['PRN'][np.where(epoch[j]==obs['TOW'])]
-        gps_seconds = np.unique(obs['TOW'][np.where(epoch[j]==obs['TOW'])])
-        gps_weeks = np.unique(obs['WEEK'][np.where(epoch[j]==obs['TOW'])])
-        # not sure this does anything
-        gps_weeks = gps_weeks.tolist()
-        gps_seconds = gps_seconds.tolist()
-
-        P1 = obs['C1'][np.where(epoch[j]==obs['TOW'])]
-        P2 = obs['P2'][np.where(epoch[j]==obs['TOW'])]
-#       do not know why this is here
-#       S1 = obs['S1'][np.where(epoch[j]==obs['TOW'])]
-        print('WEEK', gps_weeks, 'SECONDS', gps_seconds)
-        k=0
-        # set up the A matrix with empty stuff
-        M=len(sats)
-        print('Number of Satellites: ' , M)
-        A=np.zeros((M,4))
-        Y=np.zeros(M)
-        elmask = np.zeros(M, dtype=bool)
-        for prn in sats:
-            closest = myfindephem(gps_weeks, gps_seconds, ephemdata, prn) #           
-            p1=P1[k]
-            p2=P2[k]
-            p3 = ionofree(p1,p2)
-            N=len(closest)
-            if N > 0:    
-                satv, relcorr = propagate(gps_weeks, gps_seconds, closest)
-#               print("sat coor",gps_weeks,gps_seconds,satv)
-                r=np.subtract(satv,recv)
-                elea = elev_angle(u, r) # 
-                tropocorr = zd/np.sin(elea)
-                R,satv = mygeometric_range(gps_weeks, gps_seconds, prn, recv, closest)
-                A[k]=-np.array([satv[0]-recv[0],satv[1]-recv[1],satv[2]-recv[2],R])/R
-                elea = elev_angle(u,np.subtract(satv,recv))
-                elmask[k] = elea*180/np.pi > emask
-#               satellite clock correction
-                satCorr = satclock(gps_weeks, gps_seconds, prn, closest)
-                # prefit residual, ionosphere free pseudorange - geometric rnage
-                # plus SatelliteClock - relativity and troposphere corrections
-                Y[k] = p3-R+satCorr  -relcorr-tropocorr
-#               print(int(prn), k,p1,R, p1-R)
-                print(" {0:3.0f} {1:15.4f} {2:15.4f} {3:15.4f} {4:10.5f}".format(prn, p3, R, Y[k], 180*elea/np.pi))
-                k +=1
-# only vaguest notion of what is going on here - code from Ryan Hardy                
-#       applying an elevation mask
-        Y=np.matrix(Y[elmask]).T
-        A=np.matrix(A[elmask])
-        soln = np.array(np.linalg.inv(A.T*A)*A.T*Y).T[0]
-#       update Cartesian coordinates
-        newPos = recv+soln[:3]
-        print('New Cartesian solution', newPos)
-#       receiver clock solution
-#        rec_clock = soln[-1]
-        lat, lon, h = xyz2llhd(newPos)
-        print("%15.7f %15.7f %12.4f "% (lat,  lon,h) )
-# print("%15.5f"% xyz[0])
-  
-def readobs2(file,nepochX):
-    """
-    inputs: filename and number of epochs from the RINEX file you want to unpack
-    returns: receiver Cartesian coordinates (meters) and observation blocks
-    Kristine Larson, April 2017
-    18aug20: updated so that 0,0,0 is returned if there are no receiver coordinates
-    18aug21: version to include Glonass satellites etc
-    """
-    f = open(file, 'r')
-    obs = f.read()
-    f.close()
-    testV = obs.split('APPROX POSITION XYZ')[0].split('\n')[-1].split()
-#   set default receiver location values,              
-    x0=0
-    y0=0
-    z0=0
-    if len(testV) == 3:
-        x0, y0, z0 = np.array(obs.split('APPROX POSITION XYZ')[0].split('\n')[-1].split(), 
-							dtype=float)
-    types = obs.split('# / TYPES OF OBSERV')[0].split('\n')[-1].split()[1:]
-    print(types)
-    tfirst =  obs.split('TIME OF FIRST OBS')[0].split('\n')[-1].split()
-    print(tfirst)
-    ntypes = len(types)
-	#Identify unique epochs
-    countstr = '\n '+tfirst[0][2:]+' '+'%2i' % np.int(tfirst[1])+' '+'%2i' % np.int(tfirst[2])
-    print(countstr) # so this is 07 10 13, e.g.
-    # figures out how many times this string appears between END OF HEADER and end of file
-    nepoch = obs.split('END OF HEADER')[1].count(countstr)
-    
-    table = np.zeros((0, ntypes+3))
-	#Identify kinds of observations in the file
-    header = 'PRN\tWEEK\tTOW'
-    t0 = 0
-    for i in range(ntypes):
-        header += '\t'+types[i]
-    l = 0
-#    print('countstr',countstr[0])
-    print('header', header)
-    epochstr_master = re.split(countstr, obs)
-    print('number of data epochs in the file', nepoch)
-    # only unpack a limited number of epochs    #nepoch = 5
-    print('restricted number of epochs to be read ', nepochX)
-    for i in range(nepochX):
-#       clear satarray
-        satarray = []
-        epochstr = epochstr_master[i+1]        
-        print(epochstr[21:23])
-#       this is now the number of satellites properly read from the epochstr variable
-        nprn = int(epochstr[21:23])
-        print('Epochstr number of satellites',nprn)
-        # this will only work with new rinex files that use G as descriptor
-        for jj in range(nprn):
-            i2 = 26+jj*3
-            i1 = i2-3 
-            satName = epochstr[i1:i2] 
-            print(satName)
-            if satName[0] == 'R':
-#               found glonass
-                list.append(satarray, 100+int(satName[1:3]))
-            else:
-#               assume rest are GPS for now
-                list.append(satarray, int(satName[1:3]))
-            print(satarray)
-        prnstr = re.findall(r'G\d\d|G \d', epochstr.split('\n')[0])
-        
-        print(nprn, prnstr)
-        if nprn > 12:
-           # add the commant to read next line
-           print('read next line of satellite names')
-        # append
-        table = np.append(table, np.zeros((nprn, ntypes+3)), axis=0)
-        # decode year, month, day hour, minute ,second
-        # convert 2 char to 4 char year
-        # but it appears that the year and month and day 
-        # are being hardwired from the header, which is both  very very odd
-        # and stupid
-        year = int(tfirst[0])
-        month = int(tfirst[1])
-        day = int(tfirst[2])
-        hour = int(epochstr.split()[0])
-        minute = int(epochstr.split()[1])
-        second = float(epochstr.split()[2])
-        print(year, month, day, hour, minute, second)
-        week, tow = kgpsweek(year, month, day, hour, minute, second)
-        print('reading week number ', week, 'sec of week', tow)
-#       now you are saving the inforamtion to the table variable
-        table[l:l+nprn, 1] = week
-        table[l:l+nprn,2] = tow
-        for j in range(nprn):
-#            store this satellite
-            print(j, satarray[j])
-#            table[l+j, 0] = np.int(prnstr[j][1:])
-# try this - using new definition of observed satellite
-            table[l+j, 0] = satarray[j]
-            # split up by end of line markers, which makes sense
-#            print('something',2*j+1)
-            line0 = epochstr.split('\n')[2*j+1]#.split()
-            line = re.findall('.{%s}' % 16, line0+' '*(80-len(line0)))
-# this seems to get strings of a certain width, which he will later change 
-#through float# also where he made his mistake on reading last two characters 
-#            print(j,len(line), line)
-
-            for k in range(len(line)):
-                if line[k].isspace():
-                    table[l+j, 3+k] = np.nan
-                    continue
-                table[l+j, 3+k] = np.float(line[k][:-2])
-#                print(table[l+j,3+k])
-                # if more than 5 observaitons, he has to read the next line
-            if ntypes > 5:
-                line2 = epochstr.split('\n')[2*j+2].split()
-#                print(line2)
-                for k in range(len(line2)):
-                    table[l+j, 3+len(line)+k] = np.float(line2[k][:-2])
-        l += nprn	
-    format = tuple(np.concatenate((('%02i', '%4i', '%11.7f'), 
-							((0, ntypes+3)[-1]-3)*['%14.3f'])))
-    # kinda strange - but ok - format statemenst for PRN, week, sec of week, etc
-#    print(format)
-# I guess it is making a super observable so that it can later be parsed.
-# very strange 
-    obs =  dict(zip(tuple(header.split('\t')), table.T))
-
-    return np.array([x0,y0,z0]),obs
 
 def get_ofac_hifac(elevAngles, cf, maxH, desiredPrec):
     """
-    computes two factors - ofac and hifac - that are inputs to the
+    Computes two factors - ofac and hifac - that are inputs to the
     Lomb-Scargle Periodogram code.
     We follow the terminology and discussion from Press et al. (1992)
     in their LSP algorithm description.
 
-    INPUT
-    elevAngles:  vector of satellite elevation angles in degrees 
-    cf:(L-band wavelength/2 ) in meters    
-    maxH:maximum LSP grid frequency in meters
-    desiredPrec:  the LSP frequency grid spacing in meters
-    i.e. how precise you want he LSP reflector height to be estimated
-    OUTPUT
-    ofac: oversampling factor
-    hifac: high-frequency factor
+    Parameters
+    ------------
+    elevAngles:  numpy of floats
+        vector of satellite elevation angles in degrees 
+
+    cf: float
+        (L-band wavelength/2 ) in meters    
+
+    maxH: int
+        maximum LSP grid frequency in meters
+
+    desiredPrec:  float
+        the LSP frequency grid spacing in meters 
+        i.e. how precise you want he LSP reflector height to be estimated
+
+    Returns
+    -------
+    ofac: float
+        oversampling factor
+
+    hifac: float
+        high-frequency factor
+
     """
 # in units of inverse meters
     X= np.sin(elevAngles*np.pi/180)/cf     
@@ -2112,6 +1453,9 @@ def get_ofac_hifac(elevAngles, cf, maxH, desiredPrec):
 # observing Window length (or span)
 # units of inverse meters
     W = np.max(X) - np.min(X)         
+    if W == 0:
+        print('bad window length - which will lead to illegal ofac/hifac calc')
+        return 0,0
 
 # characteristic peak width, meters
     cpw= 1/W
@@ -2131,16 +1475,49 @@ def get_ofac_hifac(elevAngles, cf, maxH, desiredPrec):
 def strip_compute(x,y,cf,maxH,desiredP,pfitV,minH):
     """
     strips snr data
-    inputs; max reflector height, desiredP is desired precision in meters
-    pfitV is polynomial fit order
-    minH - do not allow LSP below this value
-    returns 
-    max reflector height and its amplitude
-    min and max observed elevation angle
-    riseSet is 1 for rise and -1 for set
-    author: Kristine Larson
+
+    Parameters
+    -----------
+    x : numpy array 
+        elevation angles in degrees
+    y : numpy array
+        SNR data 
+    cf : float
+        scale factor for given frequency
+    maxH : float
+        maximum reflector height in meters
+    desiredP : float
+        precision of Lomb Scargle in meters
+    pfitV : integer
+        polynomial order for DC model
+    minH : float
+        minimum reflector height in meters
+
+    Returns 
+    -------
+    maxF : float
+        maximum Reflector height (meters)
+    maxAmp : float
+        amplitude of periodogram
+    eminObs : float
+        minimum observed elevation angle in degrees
+    emaxObs : float
+        maximum observed elevation angle in degrees
+    riseSet : integer
+        1 for rise and -1 for set
+    px : numpy array
+        periodogram, x-axis, RH, meters
+    pz : numpy array
+        periodogram, y-axis, volts/volts 
     """
     ofac,hifac = get_ofac_hifac(x,cf,maxH,desiredP)
+    if np.isnan(ofac):
+        print("WARNING - bad ofac")
+        return 0, 0, 0, 0,0,0,0 
+    if ofac == 0:
+        print("WARNING - bad ofac")
+        return 0, 0, 0, 0,0, 0,0
+
 #   min and max observed elevation angles
     eminObs = min(x); emaxObs = max(x)
     if x[0] > x[1]:
@@ -2188,20 +1565,86 @@ def strip_compute(x,y,cf,maxH,desiredP,pfitV,minH):
 
 def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satNu,pfitV,pele,screenstats):
     """
-    author kristine m. larson
-    also calculates the scale factor for various GNNS frequencies.  currently
+
+    window the SNR data for a given satellite azimuth and elevation angle range
+
+    also calculates the scale factor for various GNSS frequencies.  currently
     returns meanTime in UTC hours and mean azimuth in degrees
     cf, which is the wavelength/2
     currently works for GPS, GLONASS, GALILEO, and Beidou
     new: pele are the elevation angle limits for the polynomial fit. these are appplied
     before you start windowing the data
-    20aug10 added screenstats boolean
+
+    Parameters
+    ----------
+    s1 : numpy array 
+        SNR L1 data, floats
+    s2 : numpy array 
+        SNR L2 data, floats 
+    s5 : numpy array
+        SNR L5 data
+    s6 : numpy array floats
+        SNR L6 data
+    s7 : numpy array floats
+        SNR L7 data
+    s8 : numpy array floats
+        SNR L8 data
+    sat : numpy array
+        satellite number
+    ele : numpy array
+        elevation angle (Degrees)
+    azi : numpy array
+        azimuth angle (Degrees)
+    seconds : numpy array
+        seconds of the day (GPS time)
+    edot : numpy array
+        elev angle time rate of change (units?)
+    f : int
+        requested frequency
+    az1 : float
+        minimum azimuth limit, degrees
+    az2 : float
+        maximum azimuth limit, degrees
+    e1 : float
+        minimum elevation angle limit, degrees
+    e2 : float
+        maximum elevation angle limit, degrees
+    satNu : int
+        requested satellite number
+    pfitV : int
+        polynomial order for DC fit
+    screenstats : bool
+        Whether statistics come to the screen
+
+    Returns
+    -------
+    x : numpy array of floats 
+        elevation angle, deg
+    y : numpy array of floats
+        SNR, db-Hz
+    Nvv : int
+        number of points in x
+    cf : float
+        refl scale factor (lambda/2)
+    meanTime : float
+        UTC hour of the arc
+    avgAzim : float
+        average azimuth of the track (degrees)
+    outFact1 : float
+        tan(elev)/elevdot, hours, from SNR file
+    outFact2 : float
+        tan(elev)/elevdot, hours, from linear fit
+    delT : float
+        track length in minutes
+
     """
     cunit = 1
     dat = []; x=[]; y=[]
 #   get scale factor
 #   added glonass, 101 and 102
-    if (f == 1) or (f==101) or (f==201):
+    if False:
+        print('frequency and satellite', f,sat)
+    if (f == 1) or (f==101) or (f==201) or (f==301):
         dat = s1
     if (f == 2) or (f == 20) or (f == 102) or (f==302):
         dat = s2
@@ -2215,14 +1658,33 @@ def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satN
     if (f == 208):
         dat = s8
 #   get the scaling factor for this frequency and satellite number
-    #print(f,satNu)
     cf = arc_scaleF(f,satNu)
-    #print(cf)
 
 #   if not, frequency does not exist, will be tripped by Nv
 #   this does remove the direct signal component - but gets you ready to do that
-    if (cf > 0):
-        x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds) 
+    #print('cf before removeDC', cf,' freq and sat ', f, satNu)
+    if (satNu > 100):
+        # check that there are even any data because this is crashing on files w/o SNR beidou data in them
+        if (f == 307):
+            if len(s7) > 0:
+                x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds) 
+            else:
+                x=[]; y=[]; sat=[];azi=[];seconds=[];edot =[]
+        elif (f == 207):
+            if len(s7) > 0:
+                x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds)
+            else:
+                x=[]; y=[]; sat=[];azi=[];seconds=[];edot =[]
+        elif (f == 208):
+            if len(s8) > 0:
+                x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds)
+            else:
+                x=[]; y=[]; sat=[];azi=[];seconds=[];edot =[]
+        else:
+            x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds) 
+    else:
+        if (cf > 0):
+            x,y,sat,azi,seconds,edot  = removeDC(dat, satNu, sat,ele, pele, azi,az1,az2,edot,seconds) 
 
 #
     Nv = len(y); Nvv = 0 ; 
@@ -2230,6 +1692,8 @@ def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satN
     meanTime = 0.0; avgAzim = 0.0; avgEdot = 1; Nvv = 0
     avgEdot_fit =1; delT = 0.0
 #   no longer have to look for specific satellites. some minimum number of points required 
+    #if screenstats:
+    #    print('Starting Npts', Nv)
     if Nv > 30:
         model = np.polyfit(x,y,pfitV)
         fit = np.polyval(model,x)
@@ -2243,9 +1707,11 @@ def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satN
         a =   azi[(ele > e1) & (ele < e2) & (azi > az1) & (azi < az2)]
         t = seconds[(ele > e1) & (ele < e2) & (azi > az1) & (azi < az2)]
         ifound = 0
+        #if screenstats:
+        #    print('Starting/Windowed Npts', Nv, len(x))
         if len(x) > 0:
             ijkl = np.argmax(x)
-            if ijkl == 0:
+            if (ijkl == 0):
             #print('ok, at the beginning ')
                 ifound = 1;
             elif (ijkl == len(x)-1):
@@ -2255,8 +1721,8 @@ def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satN
                 ifound = 3;
                 if screenstats:
                     iamok = True
-                    #print('Rising Setting Arc ' %5.0f and peak %5.0f "% (len(x),ijkl) )
-                    #print("Rising/Setting Arc, length: %5.0f eangles begin %6.2f end %6.2f peak %6.2f"% (len(x), x[0],x[-1], x[ijkl] ) )
+                    print('Rising Setting Arc, length, and index ', len(x),ijkl )
+                    print("Rising/Setting Arc, length: %5.0f eangles begin %6.2f end %6.2f peak %6.2f"% (len(x), x[0],x[-1], x[ijkl] ) )
                 edif1 = x[ijkl] - x[0]
                 edif2 = x[ijkl] - x[-1]
                 if edif1 > edif2:
@@ -2285,22 +1751,43 @@ def window_data(s1,s2,s5,s6,s7,s8, sat,ele,azi,seconds,edot,f,az1,az2,e1,e2,satN
             avgEdot_fit = model[0]
             avgAzim = np.mean(a)
             meanTime = np.mean(t)/3600
+            # this is degrees/second? - but if the values are not in the file
+            # this will be zero
             avgEdot = np.mean(ed) 
 #  delta Time in minutes
             delT = (np.max(t) - np.min(t))/60 
 # average tan(elev)
             cunit =np.mean(np.tan(np.pi*x/180))
-#           return tan(e)/edot, in units of radians/hour now. used for RHdot correction
+#           return tan(e)/edot, in units of one over (radians/hour) now. used for RHdot correction
+#           so when multiplyed by RHdot - which would be meters/hours ===>>> you will get a meter correction
     if avgEdot == 0:
         outFact1 = 0
     else:
-        outFact1 = cunit/(avgEdot*3600) 
+        # this was never implemented
+        #outFact1 = cunit/(avgEdot*3600) 
+        # rad/hour
+        outFact1 = cunit/((avgEdot*np.pi/180)*3600) 
+    # now change it to per hour ... 
     outFact2 = cunit/(avgEdot_fit*3600) 
+
     return x,y,Nvv,cf,meanTime,avgAzim,outFact1, outFact2, delT
 
 def arc_scaleF(f,satNu):
     """
-    input a frequency and put out a scale factor cf which is wavelength*0.5 
+    calculates LSP scale factor cf , the wavelength divided by 2
+
+    Parameters
+    --------
+    f : integer
+        satellite frequency
+    satNu : integer
+        satellite number (1-400)
+
+    Returns
+    -------
+    cf : float
+        GNSS wavelength/2 (meters)
+
     """ 
 #   default value for w so that if someone inputs an illegal frequency, it does not crash
     w = 0
@@ -2325,13 +1812,16 @@ def arc_scaleF(f,satNu):
             w = constants.wgL8
 #
 #   add beidou 18oct15
+#  i am confused about this ...
     if (f > 300) and (f < 310):
+        if (f == 301):
+            w = constants.wbL1
         if (f == 302):
             w = constants.wbL2
-        if (f == 307):
-            w = constants.wbL7
         if (f == 306):
             w = constants.wbL6
+        if (f == 307):
+            w = constants.wbL7
 
 #   glonass satellite frequencies
     if (f == 101) or (f == 102):
@@ -2341,21 +1831,43 @@ def arc_scaleF(f,satNu):
 
 def freq_out(x,ofac,hifac):
     """
-    inputs: x 
-    ofac: oversamping factor
-    hifac
-    outputs: two sets of frequencies arrays
+
+    Parameters
+    ------------
+    x : numpy array
+        sine(elevation angle)
+    ofac: float
+        oversamping factor
+    hifac : float
+        how far to calculate RH frequencies  (in meters)
+
+    Returns
+    ------------
+    pd: float numpy arrays
+        frequencies 
+
     """
 #
 # number of points in input array
     n=len(x)
 #
 # number of frequencies that will be used
-    nout=np.int(0.5*ofac*hifac*n)
-	 
     xmax = np.max(x) 
     xmin = np.min(x) 
+
+    #print('ofac hifac,n,xmin,xmax', ofac,hifac,n,xmin,xmax)
+
+    nout=int(0.5*ofac*hifac*n)
+	 
     xdif=xmax-xmin 
+
+    if xdif == 0:
+        return []
+    if nout == 0:
+        return []
+    if np.isnan(ofac ):
+        return []
+
 # starting frequency 
     pnow=1.0/(xdif*ofac) 
     pstart = pnow
@@ -2370,83 +1882,30 @@ def freq_out(x,ofac,hifac):
     pd = np.linspace(pstart, pstop, nout)
     return pd
 
-def find_satlist(f,snrExist):
-    """
-    inputs: frequency and boolean numpy array that tells you 
-    if a signal is (potentially) legal
-    outputs: list of satellites to use 
-    author: kristine m. larson
-    """
-# set list of GPS satellites for now
-# 
-# Block III will be 4, 18, 23, 
-#   these are the only L2C satellites as of 18oct10
-    #l2c_sat = [1, 3, 5, 6, 7, 8, 9, 10, 12, 15, 17, 24, 25, 26, 27, 29, 30, 31, 32]
-    # updated on  march 26, 2021 - really should make this time dependent ....
-    l2c_sat = [1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 17, 18, 23, 24, 25, 26, 27, 29, 30, 31, 32]
-
-#   only L5 satellites thus far
-    l5_sat = [1, 3,  4, 6,  8, 9, 10, 14, 18, 23, 24, 25, 26, 27, 30,  32]
-    # l5_sat = [1, 3,  4, 6,  8, 9, 10, 24, 25, 26, 27, 30,  32]
-#   assume l1 and l2 can be up to 32
-    l1_sat = np.arange(1,33,1)
-    satlist = []
-    if f == 1:
-        satlist = l1_sat
-    if f == 20:
-        satlist = l2c_sat
-    if f == 2:
-        satlist = l1_sat
-    if f == 5:
-        satlist = l5_sat
-#   i do not think they have 26 - but ....
-#   glonass L1
-    if (f == 101) or (f==102):
-# only have 24 frequencies defined
-        satlist = np.arange(101,125,1)
-#   galileo - 40 max?
-#   use this to check for existence, mostly driven by whether there are 
-#   extra columns (or if they are non-zero)
-    gfs = int(f-200)
-
-    if (f >  200) and (f < 210) and (snrExist[gfs]):
-        satlist = np.arange(201,241,1)
-#   galileo has no L2 frequency, so set that always to zero
-    if f == 202:
-        satlist = []
-#   pretend there are 32 Beidou satellites for now
-    if (f > 300):
-        satlist = np.arange(301,333,1)
-
-    # minimize screen output
-    #if len(satlist) == 0:
-    #    print('     illegal frequency: no sat list being returned')
-    return satlist
-
 def find_satlist_wdate(f,snrExist,year,doy):
     """
-    inputs: frequency and boolean numpy array that tells you
-    if a signal is (potentially) legal
-    outputs: list of satellites to use
+    find satellite list for a given frequency and date
 
-    now includes date informaiton so that accurate lists of l2c and l5
-    transmitting satellites are reasonable (previously it was a full list for 
-    current day, that may or may not be correct in the past)
-    author: kristine m. larson
+    Parameters
+    ----------
+    f : integer
+        frequency
+    snrExist : numpy array, bool
+        tells you if a signal is (potentially) legal
+    year : int
+        full year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    satlist: numpy list of integers
+        satellites to use
+
     june 24, 2021: updated for SVN78
-    """
-# set list of GPS satellites for now
-#
-# Block III will be 4, 18, 23
-#   these are the only L2C satellites as of 18oct10
-    #l2c_sat = [1, 3, 5, 6, 7, 8, 9, 10, 12, 15, 17, 24, 25, 26, 27, 29, 30, 31, 32]
-    # updated on 20 jul 15 - really should make this time dependent ....
-    #l2c_sat = [1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 17, 23, 24, 25, 26, 27, 29, 30, 31, 32]
 
-#   only L5 satellites thus far
-    #l5_sat = [1, 3,  6,  8, 9, 10, 24, 25, 26, 27, 30,  32]
-    # l5_sat = [1, 3,  4, 6,  8, 9, 10, 24, 25, 26, 27, 30,  32]
-#   assume l1 and l2 can be up to 32
+    """
+    # get list of relevant satellites
     l2c_sat, l5_sat = l2c_l5_list(year,doy)
 
     l1_sat = np.arange(1,33,1)
@@ -2487,11 +1946,21 @@ def find_satlist_wdate(f,snrExist,year,doy):
 
 def glonass_channels(f,prn):
     """
-    inputs frequency and prn number
-    returns wavelength for glonass satellite in meters
-    logic from Simon Williams, matlab
-    converted to function by KL, 2017 November
-    converted to python by KL 2018 September
+    Retrieves appropriate wavelength for a given Glonass satellite
+
+    Parameters
+    ----------
+    f : int
+        frequency( 101 or 102)
+    prn : int
+        satellite number
+
+    Returns
+    -------
+    l : float
+        wavelength for glonass satellite in meters
+
+    logic from Simon Williams 
     """
 #   we define glonass by adding 100.  remove this for definition of the wavelength
     if (prn > 100):
@@ -2518,46 +1987,58 @@ def glonass_channels(f,prn):
     if (f == 102):
         l = lightSpeed/(L2 + ch*dL2)
     return l
+
 def open_outputfile(station,year,doy,extension):
     """
-    inputs: station name, year, doy, and station name
-    opens output file in REFL_CODE/year/results/station directory
-    return fileID
-    author kristine m. Larson
-    if the results directory does not exist, it tries to make it. i think
-    june 2019, added snrending to output name
-    july 2020, no longer open frej file
+    opens an output file in 
+    $REFL_CODE/year/results/station/extension directory
+    for Lomb Scargle periodogram results. This really 
+    should go in a gnssir library.
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    doy : int
+        day of year
+    extension : str
+        analysis extension name (for storage of results)
+
+    Returns
+    -------
+    fileID : ?
+        I don't know the proper name of this - but what comes out
+        when you open a file so you can keep writing to it
+
     """
-    if os.path.isdir('logs'):
-        skippingxist = True
-        #print('log directory exists')
-    else:
-        #print('making log directory ')
-        subprocess.call(['mkdir', 'logs'])
+    xdir = os.environ['REFL_CODE']
+    logdir = xdir + '/logs'
+
+    if not os.path.isdir(logdir):
+        subprocess.call(['mkdir', logdir])
     fout = 0
 #   primary reflector height output goes to this directory
-    xdir = os.environ['REFL_CODE']
     cdoy = '{:03d}'.format(doy)
 #   extra file with rejected arcs
-    w = 'logs/reject.' + str(year) + '_' + cdoy  + station + '.txt'
-#    print('open output file for rejected arcs',w)
-    #frej=open(w,'w+')
-#    frej=open('reject.txt','w+')
-#   put a header in the file
-#    frej.write("%year, doy, maxF,sat,UTCtime, Azim, Amp,  eminO, emaxO,  Nv,freq,rise,Edot, PkNoise,  DelT,   MJD \n")
+    w = logdir + '/reject.' + str(year) + '_' + cdoy  + station + '.txt'
+
     filedir = xdir + '/' + str(year)  + '/results/' + station 
-#    filepath1 =  filedir + '/' + cdoy  + '.txt'
 #   changed to a function
     filepath1,fexit = LSPresult_name(station,year,doy,extension)
     #print('Output will go to:', filepath1)
+    versionNumber = 'v' + str(version('gnssrefl'))
+    #versionNumber = 'working-on-it'
+    tem = '% station ' + station + ' https://github.com/kristinemlarson/gnssrefl ' + versionNumber  + '\n'
     try:
         fout=open(filepath1,'w+')
 #       put a header in the output file
-        fout.write("% gnssrefl, https://github.com/kristinemlarson \n")
+        fout.write(tem)
         fout.write("% Phase Center corrections have NOT been applied \n")
-        fout.write("% year, doy, RH, sat,UTCtime, Azim, Amp,  eminO, emaxO,NumbOf,freq,rise,EdotF, PkNoise  DelT     MJD   refr-appl\n")
+        fout.write("% year, doy, RH, sat,UTCtime, Azim, Amp,  eminO, emaxO,NumbOf,freq,rise,EdotF, PkNoise  DelT     MJD   refr-model\n")
         fout.write("% (1)  (2)   (3) (4)  (5)     (6)   (7)    (8)    (9)   (10)  (11) (12) (13)    (14)     (15)    (16)   (17)\n")
-        fout.write("%             m        hrs    deg   v/v    deg    deg  values               hrs            min         1 is yes  \n")
+        fout.write("%             m        hrs    deg   v/v    deg    deg  values            hrs             min           0 is none \n")
     except:
         print('problem on first attempt - so try making results directory')
         f1 = xdir + '/' + str(year) + '/results/'
@@ -2573,17 +2054,74 @@ def open_outputfile(station,year,doy,extension):
             print('problems opening the file')
             sys.exit()
     frej = 100
+
     return fout, frej
+
+def lsp_header(station):
+    """
+    """
+    versionNumber = 'v' + str(version('gnssrefl'))
+    tem =  ' station ' + station + ' https://github.com/kristinemlarson/gnssrefl ' + versionNumber  + '\n'
+#       put a header in the output file
+    line2= ' Phase Center corrections have NOT been applied \n'
+    line3= ' year, doy, RH, sat,UTCtime, Azim, Amp,  eminO, emaxO,NumbOf,freq,rise,EdotF, PkNoise  DelT     MJD   refr-model\n'
+    line4= '(1)  (2)   (3) (4)  (5)     (6)   (7)    (8)    (9)   (10)  (11) (12) (13)    (14)     (15)    (16)   (17)\n'
+    line5= '            m        hrs    deg   v/v    deg    deg  values            hrs             min           0 is none \n'
+    all = tem + line2 + line3 + line4 + line5
+    return all
+
 
 def removeDC(dat,satNu, sat,ele, pele, azi,az1,az2,edot,seconds):
     """
-#   remove direct signal using given elevation angle (pele) and azimuth 
+    remove direct signal using given elevation angle (pele) and azimuth 
     (az1,az2) constraints, return x,y as primary used data and windowed
     azimuth, time, and edot
-#   removed zero points, which 10^0 have value 1.  used 5 to be sure?
+    removed zero points, which 10^0 have value 1.  used 5 to be sure?
+
+    Parameters
+    ----------
+    dat : numpy array of floats 
+        SNR data
+    satNu : float
+        requested satellite number
+    sat : numpy array of floats
+        satellite numbers
+    ele : numpy array of floats
+        elevation angles, deg
+    pele : list of floats
+        min and max elevation angles (deg)
+    azi : numpy array of floats 
+        azimuth angle, deg
+    az1 : float
+        minimum azimuth angle (deg)
+    az2 : float
+        maximum azimuth angle (deg)
+    edot : numpy array of floats  
+        derivative elevation angle (deg/sec)
+    seconds : numpy array of floatas
+        seconds of the day
+
+    Returns
+    -------
+    x : numpy array of floats
+        sine of elevation angle ( i believed)
+    y : numpy array of floats
+        SNR data in lineer units with DC component removed
+    sat : ??
+        not sure why  this is sent and returned
+    azi : numpy array of flaots
+        azimuth angles
+    seconds : numpy array of flaots
+        seconds of the day
+    edot : numpy array of floats
+        derivative of elevation angle
+
     """
     p1 = pele[0]; p2 = pele[1]
 #   look for data within these azimuth and elevation angle constraints
+    #ytest = dat[(sat == satNu)]
+    #print(len(ytest))
+
     x = ele[(sat == satNu) & (ele > p1) & (ele < p2) & (azi > az1) & (azi < az2) & (dat > 5)]
     y = dat[(sat == satNu) & (ele > p1) & (ele < p2) & (azi > az1) & (azi < az2) & (dat > 5)]
     edot = edot[(sat == satNu) & (ele > p1) & (ele < p2) & (azi > az1) & (azi < az2) & (dat > 5)]
@@ -2598,7 +2136,6 @@ def quick_plot(plt_screen, gj,station,pltname,f):
     which if > 0 there is something to plot
     also station name for the title
     pltname is png filename, if requested
-    author: kristine m. larson
     """
     if (plt_screen == 1  and gj > 0):
         plt.subplot(212)
@@ -2617,6 +2154,15 @@ def quick_plot(plt_screen, gj,station,pltname,f):
 def print_file_stats(ele,sat,s1,s2,s5,s6,s7,s8,e1,e2):
     """
     inputs 
+
+    ele
+
+    sat
+
+    s1 
+
+    s2 
+
     """
     gps = ele[(sat > 0) & (sat < 33) & (ele < e2) ]
     glonass = ele[(sat > 100) & (sat < 125) & (ele < e2) ]
@@ -2632,13 +2178,14 @@ def print_file_stats(ele,sat,s1,s2,s5,s6,s7,s8,e1,e2):
 
 
 def diffraction_correction(el_deg, temp=20.0, press=1013.25):
-    """ Computes and return the elevation correction for refraction in the atmosphere.
-
+    """ 
     Computes and return the elevation correction for refraction in the atmosphere such that the elevation of the
     satellite plus the correction is the observed angle of incidence.
 
     Based on an empirical model by G.G. Bennet.
     This code was provided by Chalmers Group, Joakim Strandberg and Thomas Hobiger
+    Bennett, G. G. The calculation of astronomical refraction in marine navigation.
+    Journal of Navigation 35.02 (1982): 255-259.
 
     Parameters
     ----------
@@ -2656,10 +2203,6 @@ def diffraction_correction(el_deg, temp=20.0, press=1013.25):
     corr_el_deg : 1d-array
         The elevation correction in degrees.
 
-    References:
-    ----------
-        Bennett, G. G. 'The calculation of astronomical refraction in marine navigation.'
-        Journal of Navigation 35.02 (1982): 255-259.
     """
     el_deg = np.array(el_deg)
 
@@ -2668,12 +2211,83 @@ def diffraction_correction(el_deg, temp=20.0, press=1013.25):
     corr_el_deg = corr_el_arc_min/60
 
     return corr_el_deg
+
+def ydoy2mjd(year,doy):
+    """
+    calculates modified julian day from year and day of year
+
+    Parameters
+    ----------
+    year : int
+        full year
+
+    doy : int
+        day of year
+
+    Returns
+    -------
+    mjd : float
+        modified julian day
+    """
+    yy,mm,dd, cyyyy, cdoy, YMD = ydoy2useful(year,doy)
+
+    mjd = getMJD(year,mm,dd,0)
+
+    return mjd
+
+def fdoy2mjd(year,fdoy):
+    """
+    calculates modified julian day from year and fractional day of year
+
+    Parameters
+    ----------
+    year : int
+        full year
+
+    fdoy : float
+        fractional day of year
+
+    Returns
+    -------
+    mjd : float
+        modified julian day
+    """
+    doy = math.floor(fdoy)
+    yy,mm,dd, cyyyy, cdoy, YMD = ydoy2useful(year,doy)
+    fract_hour = 24*(fdoy - doy)
+
+    mjd = getMJD(year,mm,dd,fract_hour)
+
+    return mjd
+
 def mjd(y,m,d,hour,minute,second):
     """
-    inputs: year, month, day, hour, minute,second
-    output: modified julian day
+    calculate the integer part of MJD and the fractional part.
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        calendar month
+    day : int
+        calendar day
+    hour : int
+        hour of day
+    minute : int
+        minute of the day
+    second : int
+        second of the day
+
+    Returns
+    -------
+    mjd : float
+        modified julian day of y-m-d
+
+    fracDay : float
+        fractional day 
+
     using information from http://infohost.nmt.edu/~shipman/soft/sidereal/ims/web/MJD-fromDatetime.html
-    coded by kristine m. larson
     """
     if  (m <= 2):
         y, m = y-1, m+12
@@ -2690,11 +2304,38 @@ def mjd(y,m,d,hour,minute,second):
     fracDay = s/86400
     return mjd, fracDay
 
+def mjd_to_datetime(mjd):
+    """
+    Parameters
+    ----------
+    mjd : float
+        modified julian date
+
+    Returns
+    -------
+    dt : datetime object
+
+    """
+    base_date=datetime.datetime(1858,11,17)
+    delta=datetime.timedelta(days=mjd)
+    dt = base_date+delta
+
+    return dt
+
 
 def doy2ymd(year, doy):
     """
-    inputs: year and day of year (doy)
-    returns: some kind of datetime construct which can be used to get MM and DD
+    Parameters
+    ----------
+    year : int
+
+    doy : int
+        day of year
+
+    Returns
+    -------
+    d : datetime object
+
     """
 
     d = datetime.datetime(year, 1, 1) + datetime.timedelta(days=(doy-1))
@@ -2703,8 +2344,22 @@ def doy2ymd(year, doy):
 
 def getMJD(year,month,day,fract_hour):
     """
-    inputs are year, month, day and fractional hour
-    return is modified julian day (real8)
+    Parameters
+    ----------
+    year : int
+
+    month : int
+
+    day : int
+
+    fract_hour : float
+        hour (fractional)
+
+    Returns 
+    -------
+    mjd : float
+        modified julian day
+
     """
 #   convert fract_hour to HH MM SS
 #   ignore fractional seconds for now
@@ -2719,9 +2374,19 @@ def getMJD(year,month,day,fract_hour):
 
 def update_plot(plt_screen,x,y,px,pz):
     """
-    input plt_screen integer value from gnssIR_lomb.
-    (value of one means update the SNR and LSP plot)
-    and values of the SNR data (x,y) and LSP (px,pz)
+    is this used?
+
+    plt_screen : int 
+        1 means update the plot
+    x : numpy array of floats 
+        elevation angles (deg)
+    y :  numpy array of floats
+        SNR data, volts/volts
+    px : numpy array of floats
+        periodogram, x-axis (meters)
+    pz : numpy array of floats 
+        periodogram, y-axis
+
     """
     if (plt_screen == 1):
         plt.subplot(211)  
@@ -2729,135 +2394,34 @@ def update_plot(plt_screen,x,y,px,pz):
         #plt.title(station)
         plt.subplot(212)  
         plt.plot(px,pz)
+
 def open_plot(plt_screen):
     """
+    is this used?
+
     simple code to open a figure, called by gnssIR_lomb
     """
     if (plt_screen == 1):
         plt.figure()
 
-def quick_rinex_snr(year, doy, station, option, orbtype,receiverrate,dec_rate):
-    """
-    inputs: year and day of year (integers) and station name
-    option is for the snr creation
-    orbtype can be nav or sp3.  if the former, then gpsSNR is used.
-    if the later, then gnssSNR
-    this assumes you follow my definitions for where things go,
-    i.e. REFL_CODE and ORBITS
-    it currently checks Unavco, SOPAC, and SONEL. I should add CDDIS
-    author: kristine m. larson
-    19may20, added decimation
-    19sep12, I got tired of code crashing for files > 20 observables.  I am thus using teqc
-    20apr15, xz compression added
-    """
-    # define directory for the conversion executables
-    #exedir = os.environ['EXE']
-    # FIRST, check to see if the SNR file already exists
-#    snrname_full,snrname_compressed = define_filename(station,year,doy,option)
-    snrname_full, snrname_compressed, snre = define_and_xz_snr(station,year,doy,option)
-    if (snre == True):
-        print('snrfile already exists:', snrname_full)
-    else:
-        print('snr does not exist so pick up orbits and rinex')
-        d = doy2ymd(year,doy); 
-        month = d.month; day = d.day
-        # new function to do the whole orbit thing
-        foundit, f, orbdir, snrexe = get_orbits_setexe(year,month,day,orbtype) 
-        # if you have the orbit file, you can get the rinex file
-        if foundit:
-            # now you can look for a rinex file
-            rinexfile,rinexfiled = rinex_name(station, year, month, day)
-            print('rinexfile should be ', rinexfile)
-            if (os.path.isfile(rinexfile) == True):
-                okok = 1
-                #print('rinex file exists')
-            else:
-                if receiverrate == 'low':
-                    rinex_unavco(station, year, month, day) 
-                else:
-                    rinex_unavco_highrate(station, year, month, day) 
-                if os.path.isfile(rinexfile):
-                    okok = 1
-                    #print('you have the rinex file')
-                else:
-                    # only keep looking if you are seeking lowrate data
-                    if receiverrate == 'low':
-                        try:
-                            #print('try to get it from SOPAC')
-                            rinex_sopac(station, year, month, day)
-                        except:
-                            print('no success at SOPAC.')
-                    if not os.path.isfile(rinexfile) and receiverrate == 'low':
-                        try:
-                            #print('try SONEL')
-                            rinex_sonel(station, year, month, day)
-                        except:
-                            print('got nothing - I give up')
-
-    # check to see if you found the rinex file
-    # should check that the orbit really exists too
-            oexist = os.path.isfile(orbdir + '/' + f) == True
-            rexist = os.path.isfile(rinexfile) == True
-            # if rinex exists
-            if rexist:
-                exc = teqc_version()
-                # get rid of all the observables i do not need
-                if os.path.isfile(exc):
-                    print('teqc executable exists, so let us use it')
-                    foutname = 'tmp.' + rinexfile
-                    fout = open(foutname,'w')
-                # not sure this will work
-                    print('try to fix glonass bug using teqc input')
-                    subprocess.call([exc, '-O.obs','S1+S2+S5+S6+S7+S8', '-n_GLONASS', '27', rinexfile],stdout=fout)
-                    fout.close()
-                # store it in the original rinex filename
-                    subprocess.call(['rm','-f',rinexfile])
-                    subprocess.call(['mv','-f',foutname, rinexfile])
-            if (rexist and dec_rate > 0):
-                try:
-                    print('decimate using teqc ', dec_rate, ' seconds')
-                    print('testing subprocess while decimating')
-                    exc = teqc_version()
-                    # exc = exedir + '/teqc' 
-                    rinexout = rinexfile + '.tmp'; cdec = str(dec_rate)
-                    fout = open(rinexout,'w')
-                    subprocess.call([exc, '-O.dec', cdec, rinexfile],stdout=fout)
-                    # not sure this is needed
-                    fout.close()
-                    # try using subprocess instead of os.system
-                    status = subprocess.call(['mv','-f', rinexout, rinexfile])
-                except:
-                    print('decimation failed')
-            if (oexist and rexist):
-            #convert to SNR file
-                snrname = snr_name(station, year,month,day,option)
-                orbfile = orbdir + '/' + f
-                try:
-                    subprocess.call([snrexe, rinexfile, snrname, orbfile, str(option)])
-                    status = subprocess.call(['rm','-f', rinexfile ])
-                except:
-                    print('no success making SNR file')
-                if os.path.isfile(snrname): 
-#                make sure it exists and is non-zero size before moving it
-                    if (os.stat(snrname).st_size == 0):
-                        print('you created a zero file size which could mean a lot of things')
-                        print('bad exe, bad snr option, do not really have the orbit file')
-                        status = subprocess.call(['rm','-f', snrname ])
-                    else:
-                        print('a SNR file was created and it is non-zero in length')
-                        print(snrname_full)
-                        store_snrfile(snrname,year,station) 
-            else:
-                print('rinex file or orbit file does not exist, so there is nothing to convert')
 
 def store_orbitfile(filename,year,orbtype):
     """
-    inputs:
-    orbit filename 
-    year
-    orbit type (nav or sp3)
-    the function moves the file into the appropriate directory
-    author: kristine larson
+    Stores orbit files locally
+
+    Parameters
+    ----------
+    filename : str
+        orbit filename
+    year : int 
+        full year
+    orbtype : str
+        kind of orbit (nav or sp3)
+
+    Returns
+    -------
+    xdir : str
+        local directory where the orbit belongs
 
     """
     # parent directory of the orbits for that year
@@ -2873,13 +2437,20 @@ def store_orbitfile(filename,year,orbtype):
         status = subprocess.call(['mv','-f', filename, xdir])
     else:
         print('The orbit file did not exist, so it was not stored')
+
     return xdir
 
 def make_snrdir(year,station):
     """
-    given a year and station name, it makes various directories needed
-    for SNR file/analysis outputs
-    author: kristine larson
+    makes various directories needed for SNR file/analysis outputs
+
+    Parameters
+    ----------
+    year : int
+        full year
+    station : str
+        4 ch station name
+
     """
     xdir = os.environ['REFL_CODE'] + '/' + str(year)
     # check that directories exist
@@ -2894,9 +2465,17 @@ def make_snrdir(year,station):
 
 def store_snrfile(filename,year,station):
     """
-    simple code to move an snr file to the right place 
-    inputs are the filename, the year, and the station name
-    author: kristine larson
+    move an snr file to the right place 
+
+    Parameters
+    ----------
+    filename  : str
+        name of SNR file
+    year : int
+        full year
+    station : str
+        4 ch station name
+
     """
     xdir = os.environ['REFL_CODE'] + '/' + str(year)
     # check that directories exist
@@ -2915,56 +2494,112 @@ def store_snrfile(filename,year,station):
 
 def rinex_name(station, year, month, day):
     """
-    author: kristine larson
-    given station (4 char), year, month, day, return rinexfile name
-    and the hatanaka equivalent
+    Defines rinex 2.11 file name
+
+    Parameters
+    ---------
+    station : str
+        4 character station ID
+    year : int
+        full year
+    month : int
+
+    day : int 
+
+    Returns
+    -------
+    fnameo : str
+         RINEX 2.11 name
+
+    fnamed : 
+         RINEX 2.11 name, Hatanaka compressed
+
     """
-    if day == 0:
-        doy = month
-        cyyyy = str(year)
-        #cyy = str(year-2000)
-        cdoy = '{:03d}'.format(month)
-        cyy =  '{:02d}'.format(year-2000)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
 
     fnameo = station + cdoy + '0.' + cyy + 'o'
     fnamed = station + cdoy + '0.' + cyy + 'd'
+
     return fnameo, fnamed
 
 def snr_name(station, year, month, day,option):
     """
-    author: kristine larson
-    given station (4 char), year, month, day, and snr option,
-    return snr filename (and directory) using my system
+    Defines SNR filename
+
+    Parameters
+    --------
+    station : str
+        4 ch station name
+
+    year : int
+
+    month : int
+
+    day : int
+
+    option : int
+        snr filename delimiter, i.e. 66
+
+    Returns
+    -------
+    fname : string
+        snr filename 
     """
     doy,cdoy,cyyy,cyy = ymd2doy(year,month,day)
 
     fname = station + cdoy + '0.' + cyy + '.snr' + str(option)
+
     return fname
 
 def nav_name(year, month, day):
     """
-    kristine m. larson
-    inputs are year month and day
-    returns nav file name and directory
+    returns the name and location of the navigation file
+
+    Parameters
+    ----------
+    year : integer
+
+    month : integer
+
+    day : integer
+
+    Returns
+    -------
+    navfilename : str
+        name of the navigation file
+
+    navfiledir : str
+        local directory where navigation file will be stored
     """
-    if (day == 0):
-#        print('using doy instead of month and day')
-        cdoy = '{:03d}'.format(month)
-        cyyyy = str(year)
-        cyy = '{:02d}'.format(year-2000)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
     navfilename = 'auto'  + cdoy + '0.' + cyy  +  'n'
     navfiledir = os.environ['ORBITS'] + '/' + cyyyy + '/nav'
+
     return navfilename,navfiledir
 
 def sp3_name(year,month,day,pCtr):
     """
-    kristine m. larson
-    inputs are year month and day and processing center
-    returns sp3 file name and directory
+    defines old-style sp3 name
+
+    Parameters
+    -------------
+    year : int
+
+    month : int
+
+    day : int
+
+    pCtr : str
+        Orbit processing center
+
+    Returns
+    -------
+    sp3name : str
+        old-style (lowercase) IGS name for sp3 file
+    sp3dir : str
+        where file is stored locally
+
     """
     name,clkn=igsname(year,month,day)
     gps_week = name[3:7]
@@ -2972,177 +2607,73 @@ def sp3_name(year,month,day,pCtr):
     sp3dir = os.environ['ORBITS'] + '/' + str(year) + '/sp3'
     return sp3name, sp3dir
 
-def rinex_unavco_obs(station, year, month, day):
-    """
-    author: kristine larson
-    picks up a RINEX file from unavco.  
-    normal observation file - not Hatanaka
-    new version i was testing out
-    """
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day) 
-    unavco= 'ftp://data-out.unavco.org' 
-    filename = rinexfile + '.Z'
-    url = unavco+ '/pub/rinex/obs/' + cyyyy + '/' + cdoy + '/' + filename
-    print(url)
-    try:
-        wget.download(url,filename)
-        subprocess.call(['uncompress',filename])
-    except:
-        print('some kind of problem with download',rinexfile)
-
 
 def rinex_unavco_highrate(station, year, month, day):
     """
-    author: kristine larson
-    picks up a RINEX file from unavco.  it tries to pick up an o file,
-    but if it does not work, it tries the "d" version, which must be
-    decompressed.  the location of this executable is defined in the crnxpath
-    variable. This is from the main unavco directory - not the highrate directory.
+    picks up a 1-Hz RINEX 2.11 file from unavco.  
 
-    WARNING: only rinex version 2 in this world
-    21sep02 - update from ftp to https, also added doy work around
+    Parameters
+    -------------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    month : int
+        month number
+    day : int
+        calendar day number
+
     """
+    #print('in rinex_unavco_highrate')
     crnxpath = hatanaka_version()
     # added this for people that submit doy instead of month and day
-    if day == 0:
-        doy = month
-        cyyyy = str(year)
-        cdoy = '{:03d}'.format(doy)
-        cyy = '{:02d}'.format(year-2020)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    #doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
     rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    #unavco= 'ftp://data-out.unavco.org'
-    unavco= 'https://data.unavco.org/archive/gnss/highrate/1-Hz/rinex/'
+
+    #unavco = 'https://data-idm.unavco.org/archive/gnss/highrate/1-Hz/rinex/' 
+    unavco = 'https://data.unavco.org/archive/gnss/highrate/1-Hz/rinex/'
+
 
     filename1 = rinexfile + '.Z'
     filename2 = rinexfiled + '.Z'
-    # URL path for the o file and the d file
-    #url1 = unavco+ '/pub/highrate/1-Hz/rinex/' + cyyyy + '/' + cdoy + '/' + station + '/' + filename1
-    #url2 = unavco+ '/pub/highrate/1-Hz/rinex/' + cyyyy + '/' + cdoy + '/' + station + '/' + filename2
-    # new path names
     url1 = unavco+  cyyyy + '/' + cdoy + '/' + station + '/' + filename1
     url2 = unavco+  cyyyy + '/' + cdoy + '/' + station + '/' + filename2
-    print('looking here')
-    print(url1)
-    print(url2)
+    #print(url1)
+    #print(url2)
 
     # hatanaka executable has to exist
+    s1 = time.time()
     if os.path.isfile(crnxpath): 
+        #print('try', url2, filename2)
+
         try:
-            wget.download(url2,filename2)
-            subprocess.call(['uncompress',filename2])
-            subprocess.call([crnxpath, rinexfiled])
-            subprocess.call(['rm','-f',rinexfiled])
+            #wget.download(url2,filename2) old way
+            foundit,file_name = kelly.the_kelly_simple_way(url2,filename2)
+            if foundit:
+                subprocess.call(['uncompress',filename2])
+                subprocess.call([crnxpath, rinexfiled])
+                subprocess.call(['rm','-f',rinexfiled])
         except:
             okok = 1
     if not os.path.isfile(rinexfile):
-        #print('did not find d file - will look for an o file')
+        #print('Did not find Hatanaka. Try for obs file')
+        #print('try', url1, filename1)
         try:
-            wget.download(url1,filename1)
-            subprocess.call(['uncompress',filename1])
+            #wget.download(url1,filename1) old way
+            foundit,file_name = kelly.the_kelly_simple_way(url1,filename1)
+            if foundit:
+                subprocess.call(['uncompress',filename1])
         except:
             okok = 1
-            #print('failed to find either RINEX file at unavco')
+    s2 = time.time()
+    print('That download experience took ', int(s2-s1), ' seconds.')
 
-
-def new_big_Disk_in_DC(station, year, month, day):
-    """
-    author: kristine larson
-    21aug28 uses https instead of ftp
-
-    picks up gzip o file 
-    removed Z option and now only use gz with d file
-    """
-    # get the proper path/name of the hatanaka code
-    crnxpath = hatanaka_version()
-    if day == 0:
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    # as i understand it this file type has gone away
-    comp_rinexfiled = rinexfiled + '.Z'
-    gzip_rinexfile = rinexfile + '.gz'
-    # added 21aug30
-    gzip_rinexfiled = rinexfiled + '.gz'
-    #mainadd = 'ftp://www.ngs.noaa.gov/cors/rinex/'
-    # KL updated august 28, 2021
-    mainadd = 'https://geodesy.noaa.gov/corsdata/rinex/'
-    url = mainadd + str(year) + '/' + cdoy+ '/' + station + '/' + gzip_rinexfile 
-    try:
-        wget.download(url, out=gzip_rinexfile)
-        status = subprocess.call(['gunzip', gzip_rinexfile])
-    except:
-        okok = 1
-
-    if os.path.isfile(rinexfile):
-        okok = 1
-        #print('found it')
-    else:
-        print('Look for hatanaka file with gzip')
-        try:
-            url = mainadd + str(year) + '/' + cdoy+ '/' + station + '/' + gzip_rinexfiled 
-            wget.download(url, out=gzip_rinexfiled)
-            subprocess.call(['gunzip',gzip_rinexfiled])
-            # un hatanaka
-            subprocess.call([crnxpath, rinexfiled])
-            # remove d file
-            subprocess.call(['rm','-f',rinexfiled])
-        except:
-            okok = 1
-
-def big_Disk_in_DC(station, year, month, day):
-    """
-    author: kristine larson
-    picks up a RINEX file from CORS.  
-    changed it to pick up gzip o file instead of d file.  Not sure why they have 
-    both but the d file appears to be 30 sec, and that I do not want
-    allow doy to be sent to code in the month spot.  set day to zero
-    """
-    # get the proper path/name of the hatanaka code
-    crnxpath = hatanaka_version()
-    if day == 0:
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    comp_rinexfiled = rinexfiled + '.Z'
-    gzip_rinexfile = rinexfile + '.gz'
-    mainadd = 'ftp://www.ngs.noaa.gov/cors/rinex/'
-    #url = mainadd + str(year) + '/' + cdoy+ '/' + station + '/' + comp_rinexfiled 
-    url = mainadd + str(year) + '/' + cdoy+ '/' + station + '/' + gzip_rinexfile 
-    try:
-        wget.download(url, out=gzip_rinexfile)
-        status = subprocess.call(['gunzip', gzip_rinexfile])
-    except:
-        okok = 1
-
-    if os.path.isfile(rinexfile):
-        print('found it')
-    else:
-        print('try hatanaka')
-        try:
-            url = mainadd + str(year) + '/' + cdoy+ '/' + station + '/' + comp_rinexfiled 
-            wget.download(url, out=comp_rinexfiled)
-            subprocess.call(['uncompress',comp_rinexfiled])
-            #subprocess.call([crnxpath,comp_rinexfiled])
-            # get rid of d file
-            #subprocess.call(['rm',comp_rinexfiled])
-        except:
-            okok = 1
 
 def ydoy2ymd(year, doy):
     """
     inputs: year and day of year (doy)
     returns: year, month, day
-    author: kristine larson
     """
 
     d = datetime.datetime(year, 1, 1) + datetime.timedelta(days=(doy-1))
@@ -3157,7 +2688,6 @@ def rewrite_UNR_highrate(fname,station,year,doy):
     no header, but year, month, day, day of year, seconds vertical, east, north
     the latter three are in meters
     stores in $REFL_CODE/yyyy/pos/station
-    author: kristine larson
     """
 # make sure the various output directories  are there
     xdir = os.environ['REFL_CODE'] 
@@ -3200,14 +2730,40 @@ def month_converter(month):
 def char_month_converter(month):
     """
     integer month to 3 character month
+
+    Parameters 
+    ----------
+    month : int
+        integer month (1-12)
+
+    Returns 
+    ----------
+    month : str
+        three char month, uppercase
+
     """
     months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
     return months[(month-1)]
 
 def UNR_highrate(station,year,doy):
     """
-    input station name and it picks up the 5 minute time series from UNR website
-    returns name of the file and an iostat
+    picks up the 5 minute time series from UNR website for a given station
+
+    Parameters
+    ----------
+    station : str
+        4 character station name
+    year : int
+        full year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    filename : str
+        output filename
+    goodDownload : bool
+        whether your download was successful
 
     """
     yy,mm,dd, cyyyy, cdoy, YMD = ydoy2useful(year,doy)
@@ -3230,11 +2786,11 @@ def UNR_highrate(station,year,doy):
 
 def mjd_to_date(jd):
     """
-# KL converted from this reference
-# https://gist.github.com/jiffyclub/1294443
+    https://gist.github.com/jiffyclub/1294443
+
     Converts Modified Julian Day to y,m,d
     
-    Algorithm from 'Practical Astronomy with your Calculator or Spreadsheet', 
+    Algorithm from Practical Astronomy with your Calculator or Spreadsheet 
         4th ed., Duffet-Smith and Zwart, 2011.
     
     Parameters
@@ -3313,19 +2869,19 @@ def getseries(site):
     # NA12 env rapid time series
     fname3 = 'tseries/' + siteid + '.NA12.rapid.tenv3'
 
-    if (os.path.isfile(fname) == True):
+    if (os.path.isfile(fname) ):
         print ('Timeseries file ' + fname + ' already exists')
     else:
         url = 'http://geodesy.unr.edu/gps_timeseries/tenv3/IGS08/' + siteid + '.IGS08.tenv3'
         wget.download(url, out='tseries/')
 #
-    if (os.path.isfile(fname2) == True):
+    if (os.path.isfile(fname2)):
         print ('Timeseries file ' + fname2 + ' already exists')
     else:
         url = 'http://geodesy.unr.edu/gps_timeseries/tenv3/NA12/' + siteid + '.NA12.tenv3'
         wget.download(url, out='tseries/')
 
-    if (os.path.isfile(fname3) == True):
+    if (os.path.isfile(fname3)):
         print ('Timeseries file ' + fname3 + ' already exists')
     else:
         url = 'http://geodesy.unr.edu/gps_timeseries/rapids/tenv3/NA12/' + siteid + '.NA12.tenv3'
@@ -3334,7 +2890,12 @@ def getseries(site):
 def rewrite_tseries(station):
     """
     given a station name, look at a daily blewitt position (ENV) 
-    file and write a new file that is less insane to understand
+    file and write a new file that is more human friendly
+
+    Parameters
+    ----------
+    station : str
+        4 character station name
     """
     siteid = station.upper()
     # NA12 env time series
@@ -3358,7 +2919,7 @@ def rewrite_tseries(station):
             f.write(" {0:4.0f} {1:2.0f} {2:2.0f} {3:3.0f} {4:13.4f} {5:13.4f} {6:13.4f} \n".format(yy,mm,dd,doy,east,north,vert))
         f.close()
     except:
-        print('some problem writing the output')
+        print('some problem writing the new output file')
 
 def rewrite_tseries_igs(station):
     """
@@ -3389,30 +2950,32 @@ def rewrite_tseries_igs(station):
     except:
         print('some problem writing the output')
 
-def codclock(year,month,day):
-    """
-    author: kristine lasron
-    pick up 5 second clocks from the bernese group...
-
-    not using this - so have not added CDDIS secure ftp
-    """
-    n,nn=igsname(year,month,day)
-    gps_week = n[3:7]
-    file1 = nn + '.Z'
-    print(nn, gps_week, file1)
-    h = 'ftp://cddis.gsfc.nasa.gov/gnss/products/' 
-    url = h + str(gps_week) + '/' + file1
-    print(url)
-    try:
-        wget.download(url, out=file1)
-        subprocess.call(['gunzip','-f',file1])
-    except:
-        print('some kind of problem downloading clock files')
 
 def llh2xyz(lat,lon,height):
     """
-    inputs lat,lon (in degrees) and ellipsoidal height (in meters)
-    returns Cartesian values in meters.
+    converts llh to Cartesian values
+
+    Parameters
+    -----------
+    lat : float
+        latitude in degrees
+
+    lon : float
+        longitude in degrees
+
+    height : float
+        ellipsoidal height in meters
+
+    Returns
+    -------
+    x : float
+        X coordinate (m)
+
+    y : float
+        Y coordinate (m)
+
+    z : float
+        Z coordinate (m)
 
     Ref: Decker, B. L., World Geodetic System 1984,
     Defense Mapping Agency Aerospace Center.
@@ -3422,22 +2985,41 @@ def llh2xyz(lat,lon,height):
     f= 1/298.257223563;
     NAV_E2 = (2-f)*f; # also e^2
     deg2rad = math.pi/180.0
+    if ((lat+lon+height) == 0):
+        print('You have entered all zero values')
+        x=0; y=0; z=0
+    else:
+        slat = math.sin(lat*deg2rad);
+        clat = math.cos(lat*deg2rad);
+        r_n = A_EARTH/(math.sqrt(1 - NAV_E2*slat*slat))
+        x= (r_n + height)*clat*math.cos(lon*deg2rad)
+        y= (r_n + height)*clat*math.sin(lon*deg2rad)
+        z= (r_n*(1 - NAV_E2) + height)*slat
 
-    slat = math.sin(lat*deg2rad);
-    clat = math.cos(lat*deg2rad);
-    r_n = A_EARTH/(math.sqrt(1 - NAV_E2*slat*slat))
-    x= (r_n + height)*clat*math.cos(lon*deg2rad)
-    y= (r_n + height)*clat*math.sin(lon*deg2rad)
-    z= (r_n*(1 - NAV_E2) + height)*slat
     return x, y, z
 
 def LSPresult_name(station,year,doy,extension):
     """
-    given station name, year, doy, and extension
-    returns the location of the LSP result
-    also returns boolean if it already exists (so that
-    information can be used)
-    extension is now used
+    Makes filename for the Lomb Scargle output
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    doy : int
+        day of year
+    extension : str
+        name of subdirectory for results
+
+    Returns
+    -------
+    filepath1 : str
+        where Lomb Scargle output goes
+    fileexists : bool
+        whether output already exists
+
     """
     # for testing
     xdir = os.environ['REFL_CODE']
@@ -3458,21 +3040,26 @@ def LSPresult_name(station,year,doy,extension):
 
     filepath1 =  filedirx + '/' + cdoy  + '.txt'
 
-    #print('output for this date will go to:', filepath1)
     if os.path.isfile(filepath1):
-        #print('A result file already exists')
         fileexists = True
     else:
-        #print('A result file does not exist')
         fileexists = False
+
     return filepath1, fileexists
 
 def result_directories(station,year,extension):
     """
-    inputs station, year, and extension
-    makes output directories for results
-    jun30, 2019
-    kristine larson
+    Creates directories for results
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    extension : str
+        subdirectory for results (used for analysis strategy)
+
     """
     xdir = os.environ['REFL_CODE']
     cyear = str(year)
@@ -3494,8 +3081,6 @@ def result_directories(station,year,extension):
         f1 = f1 + '/' + extension
         if not os.path.isdir(f1):
             subprocess.call(['mkdir',f1])
-    #else:
-        #print('no extension')
 
     f1 = xdir + '/' + cyear + '/phase'
     if not os.path.isdir(f1):
@@ -3505,74 +3090,151 @@ def result_directories(station,year,extension):
     if not os.path.isdir(f1):
         subprocess.call(['mkdir',f1])
 
-def write_QC_fails(delT,delTmax,eminObs,emaxObs,e1,e2,ediff,maxAmp, Noise,PkNoise,reqamp):
+def write_QC_fails(delT,delTmax,eminObs,emaxObs,e1,e2,ediff,maxAmp, Noise,PkNoise,reqamp,tooclose2edge,fileid):
     """
     prints out various QC fails to the screen
 
+    Parameters
+    ----------
+    delT : float
+        how long the satellite arc is (minutes)
+    delTmax : float
+        max satellite arc allowed (minutes)
+    eminObs: float
+        minimum observed elev angle (deg)
+    emaxObs : float
+        maximum observed elev angle (deg)
+    e1 : float
+        minimum allowed elev angle (deg)
+    e2 : float
+        maximum allowed elev angle (deg)
+    ediff : float
+        allowed min/max elevation diff from obs min/max elev angle (deg) 
+    maxAmp : float
+        measured peak LSP 
+    Noise : float
+        measured noise value for the periodogram
+    PkNoise : float
+        required peak to noise
+    reqamp : float
+        require peak LSP
+    tooclose2edge : bool
+        wehther peak value is too close to begining or ending of the RH constraints
+    fileid : ?
+        file identifier
+
     """
-    if delT > delTmax:
-        print('     Obs delT {0:.1f} minutes vs {1:.1f} requested limit '.format(delT,delTmax ))
-    if eminObs  > (e1 + ediff):
-        print('     Obs emin {0:.1f} is higher than {1:.1f} +- {2:.1f} degrees '.format(eminObs, e1, ediff ))
-    if emaxObs  < (e2 - ediff):
-        print('     Obs emax {0:.1f} is lower than {1:.1f} +- {2:.1f} degrees'.format(emaxObs, e2, ediff ))
-    if maxAmp < reqamp:
-        print('     Obs Ampl {0:.1f} vs {1:.1f} required '.format(maxAmp,reqamp  ))
-    if maxAmp/Noise < PkNoise:
-        print('     Obs PkN  {0:.1f} vs {1:.1f} required'.format(maxAmp/Noise, PkNoise ))
+    if fileid is not None:
+        fileid.write('delT {0:3.1f} delTmax {1:3.1f} Obs emin/emax {2:6.2f} {3:6.2f} Setting e1 e2 ediff {4:6.2f} {5:6.2f} {6:3.1f} \n'.format(delT, delTmax,eminObs,emaxObs,e1,e2,ediff))
+
+        fileid.write('Obs/Request Amplitude {0:5.2f} {1:5.2f} Peak2Noise {2:5.2f} {3:5.2f} \n'.format(maxAmp,reqamp,Noise,PkNoise))
+        if tooclose2edge:
+            fileid.write('     Retrieved reflector height too close to the edge of the RH space')
+
+    # did not want to re-indent
+    if False:
+        if delT >= delTmax:
+            print('     Obs delT {0:.3f} minutes vs {1:.1f} requested limit '.format(delT,delTmax ))
+        if eminObs  > (e1 + ediff):
+            print('     Obs emin {0:.1f} is higher than {1:.1f} +- {2:.1f} degrees '.format(eminObs, e1, ediff ))
+        if emaxObs  < (e2 - ediff):
+            print('     Obs emax {0:.1f} is lower than {1:.1f} +- {2:.1f} degrees'.format(emaxObs, e2, ediff ))
+        if maxAmp < reqamp:
+            print('     Obs Ampl {0:.1f} vs {1:.1f} required '.format(maxAmp,reqamp  ))
+        if maxAmp/Noise < PkNoise:
+            print('     Obs PkN  {0:.1f} vs {1:.1f} required'.format(maxAmp/Noise, PkNoise ))
+    if fileid is not None:
+        if delT >= delTmax:
+            fileid.write('     Obs delT {0:.3f} minutes vs {1:.1f} requested limit \n'.format(delT,delTmax ))
+        if eminObs  > (e1 + ediff):
+            fileid.write('     Obs emin {0:.1f} is higher than {1:.1f} +- {2:.1f} degrees \n'.format(eminObs, e1, ediff ))
+        if emaxObs  < (e2 - ediff):
+            fileid.write('     Obs emax {0:.1f} is lower than {1:.1f} +- {2:.1f} degrees\n'.format(emaxObs, e2, ediff ))
+        if maxAmp < reqamp:
+            fileid.write('     Obs Ampl {0:.1f} vs {1:.1f} required \n'.format(maxAmp,reqamp  ))
+        if maxAmp/Noise < PkNoise:
+            fileid.write('     Obs PkN  {0:.1f} vs {1:.1f} required \n'.format(maxAmp/Noise, PkNoise ))
+        if tooclose2edge:
+            fileid.write('     Retrieved reflector height too close to the edge of the RH space \n')
         
 def define_quick_filename(station,year,doy,snr):
     """
-    given station name, year, doy, snr type
-    returns snr filename but without default directory structure
-    author: Kristine Larson
-    19mar25: return compressed filename too
+    defines SNR File name
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    doy : int
+        day of year
+    snr : int
+        snr file type (66,88, etc)
+
+    Returns 
+    -------
+    f : str
+        SNR filename
+
     """
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
+    cyyyy, cyy, cdoy = ydoych(year,doy)
     f= station + str(cdoy) + '0.' + cyy + '.snr' + str(snr)
     return f
 
 def update_quick_plot(station, f):
     """
-    input plt_screen integer value from gnssIR_lomb.
-    (value of one means update the SNR and LSP plot)
-    and values of the SNR data (x,y) and LSP (px,pz)
+    updates plot in quickLook
+
+    Parameters
+    ----------
+    station : str
+        4 ch name
+    f : int
+        frequency
     """
     plt.subplot(212)
     plt.xlabel('reflector height (m)'); plt.title('SNR periodogram')
     plt.subplot(211)
     plt.xlabel('elev Angles (deg)')
-    #ftitle(freq)
     plt.title(station + ' SNR Data/' + ftitle(f) + ' Frequency') 
 
     return True
 
 def navfile_retrieve(navfile,cyyyy,cyy,cdoy):
     """
-    inputs are navfile name and character strings for year, two character year, and 
-    day of year.
-    output: a boolean is returned if the file exists
-    the code tries to find a file at unavco first, then sopac, then cddis.  it checks for illegal
-    files at sopac. it stores the file as autoDDD0.YYn where DDD is day of year and YY
-    is two charadter year irregardless of what the original name is.
-    author: kristine larson, september 2019
-    CHANGED April 2, 2020  Should not use the Sc02 file from UNAVCO.  This was a poor
-    choice. Now will use CDDIS first, then SOPAC, 
-    I have removed unavco as they do not seem to provide global nav files
-    If they do, I do not know where they are kept.
+    retrieves navfile from either SOPAC or CDDIS
 
-    20jun14 added secure ftp for CDDIS
-    21jan05 gzip after december 1, 2020, because, you know, CDDIS
+    Parameters 
+    ----------
+    navfile : str
+        name of the broadcast orbit file
+    cyyyy :  str
+        4 character yaer
+    cyy : string
+        2 character year
+    cdoy : str
+        3 character day of year
+
+    Returns
+    -------
+    FileExists : bool
+        whether the file was found
+
     """
     navname = navfile
     FileExists = False
-    #print('try sopac')
-    get_sopac_navfile(navfile,cyyyy,cyy,cdoy) 
-
-    if not os.path.isfile(navfile):
-        print('sopac did not work, so try cddis')
-        get_cddis_navfile(navfile,cyyyy,cyy,cdoy) 
+    xx=get_sopac_navfile(navfile,cyyyy,cyy,cdoy) 
+    
+    cddis_is_failing = False
+    if not os.path.isfile(navfile) :
+        if not cddis_is_failing:
+            print('SOPAC download did not work, so will try CDDIS')
+            get_cddis_navfile(navfile,cyyyy,cyy,cdoy) 
+        else:
+            print('CDDIS is unreliable and is being blocked by us')
+    else:
+        print('found nav file at SOPAC')
 
     if os.path.isfile(navfile):
         FileExists = True
@@ -3584,6 +3246,11 @@ def navfile_retrieve(navfile,cyyyy,cyy,cdoy):
 def make_nav_dirs(yyyy):
     """
     input year and it makes sure output directories are created for orbits
+
+    Parameters
+    ----------
+    yyyy : int
+        year
     """
     n = os.environ['ORBITS']
     # if parent nav dir does not exist, exit
@@ -3611,10 +3278,25 @@ def make_nav_dirs(yyyy):
 def check_inputs(station,year,doy,snr_type):
     """
     inputs to Lomb Scargle and Rinex translation codes
-    are checked for sensibility. Returns true or false to 
-    code can exit. Error messages sent to the screen
-    author: kristine m. larson
-    2019sep22
+    are checked for sensibility. Returns true or false so 
+    code can exit. 
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    doy : int
+        day of year
+    snr_type : int
+        snr file type (e.g. 66)
+
+    Returns
+    -------
+    exitSys : bool
+        whether fatal error is trigger by a bad choice 
+
     """
     exitSys = False
     if len(station) != 4:
@@ -3685,13 +3367,21 @@ def rewrite_tseries_wrapids(station):
 
 def back2thefuture(iyear, idoy):
     """
-    user inputs iyear and idoy
-    and the code checks that this is not a day in the future
-    also don't allow the dates to agree exactly because we 
-    do not have the current day's orbit file available (though
-    it could be chagned to allow it.
+    code checks that this is not a day in the future
+    also rejects data before the year 2000
 
-    reject data before the year 2000
+    Parameters
+    ----------
+    iyear : int
+        full year
+    idoy : int
+        day of year
+
+    Returns
+    -------
+    badDay : bool
+        whether your day exists (yet)
+
     """
     # find out today's date
     year = int(date.today().strftime("%Y"));
@@ -3711,142 +3401,22 @@ def back2thefuture(iyear, idoy):
 
     return badDay
 
-def rinex_ga_lowrate(station,year,month,day):
-    """
-    pick up lowrate data from Geoscience Australia
-    only Rinex 2.11 for now
-    kristine larson
-    20jul10: change from year doy to year month day, because that is what the others are
-    20sep02: change ftp site and Z to gz (per IGS mail from Ryan Ruddick)
-    20sep02: allow year, doy input by setting day to zero (send doy in month slot)
-    """
-    fexists = False
-    crnxpath = hatanaka_version()
-#    print('trying geoscience australia')
-
-
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    csrate = '30'
-    r3 = station.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
-    # changed september 2, 2020
-    #print(r3)
-    #ftpg = 'ftp://ftp.ga.gov.au/geodesy-outgoing/gnss/data/daily/' + cyyyy + '/' + cyy + cdoy  + '/'
-    #dnameZ = station + cdoy + '0.' + cyy + 'd.Z' 
-    ftpg = 'ftp://ftp.data.gnss.ga.gov.au/daily/' + cyyyy + '/' + cdoy  + '/'
-    dnameZ = station + cdoy + '0.' + cyy + 'd.gz' 
-    dname = station + cdoy + '0.' + cyy + 'd'
-    rname = station + cdoy + '0.' + cyy + 'o'
-    url = ftpg + dnameZ
-    print(url)
-    try:
-        wget.download(url,dnameZ)
-        if os.path.isfile(dnameZ):
-            status = subprocess.call(['gunzip', dnameZ])
-            status = subprocess.call([crnxpath, dname])
-            status = subprocess.call(['rm', '-f', dname])
-    except:
-        print('download from GA did not work')
-
-    if os.path.isfile(rname):
-        print('file found')
-        fexists = True
-
-    return fexists
-
-def rinex_nrcan_highrate(station, year, month, day):
-    """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a higrate RINEX file from NRCAN
-    you can input day =0 and it will assume month is day of year
-    not sure if it merges them ...
-    2020 September 2 - moved to gz and new ftp site
-    """
-    crnxpath = hatanaka_version()
-    teqcpath = teqc_version()
-    alpha='abcdefghijklmnopqrstuvwxyz'
-    # if doy is input
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    # NRCAN moving to new server names,
-    #  cacsa.nrcan.gc.ca and cacsb.nrcan.gc.ca
-    #gns = 'ftp://rtopsdata1.geod.nrcan.gc.ca/gps/data/hrdata/' +cyy + cdoy + '/' + cyy + 'd/'
-    gns = 'ftp://cacsa.nrcan.gc.ca/gps/data/hrdata/' +cyy + cdoy + '/' + cyy + 'd/'
-
-    # no point downloading data if the teqc code is not there
-    if not os.path.isfile(teqcpath):
-        print('FATAL WARNING: You need to install teqc to use gnssrefl with highrate RINEX data from NRCAN.')
-        return
-
-
-    foundFile = 0
-    print('WARNING: downloading highrate RINEX data is a slow process')
-    for h in range(0,24):
-        # subdirectory
-        ch = '{:02d}'.format(h)
-        print('\n Hour: ', ch)
-        for e in ['00', '15', '30', '45']:
-            dname = station + cdoy + alpha[h] + e + '.' + cyy + 'd.Z'
-            dname1 = station + cdoy + alpha[h] + e + '.' + cyy + 'd'
-            dname2 = station + cdoy + alpha[h] + e + '.' + cyy + 'o'
-            url = gns +  ch + '/' + dname
-            print(url)
-            try:
-                wget.download(url,dname)
-                subprocess.call(['uncompress',dname])
-                subprocess.call([crnxpath, dname1])
-                subprocess.call(['rm',dname1])
-                foundFile = foundFile + 1
-            except:
-                okok = 1
-                #print('download failed for some reason')
-
-    print('found ', foundFile ,' files')
-#direc = '.'
-#all_files = os.listdir(direc)
-#for f in all_files:
-#    if (f[0:7] == station + cdoy):
-#        print('found one', f)
-
-    if os.path.isfile(teqcpath) and (foundFile > 0):
-        foutname = 'tmp.' + station + cdoy
-        rinexname = station + cdoy + '0.' + cyy + 'o'
-        print('Attempt to merge the 15 minute files and move to ', rinexname)
-        mergecommand = [teqcpath + ' +quiet ' + station + cdoy + '*o']
-        fout = open(foutname,'w')
-        subprocess.call(mergecommand,stdout=fout,shell=True)
-        fout.close()
-        cm = 'rm ' + station + cdoy + '*o'
-        print(cm)
-        # if the output is made (though I guess this does not check to see if it is empty)
-        if os.path.isfile(foutname):
-            # try to remove the 15 minute files
-            subprocess.call(cm,shell=True)
-            subprocess.call(['mv',foutname,rinexname])
-    else:
-        if (foundFile == 0):
-            print('No data could be retrieved from NRCAN')
-        if not os.path.isfile(teqcpath):
-            print('You need to install teqc to merge NRCAN 15 minute RINEX files. ')
-
 
 def rinex_ga_highrate(station, year, month, day):
     """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a higrate RINEX file from Geoscience Australia
-    you can input day =0 and it will assume month is day of year
-    not sure if it merges them ...
-    2020 September 2 - moved to gz and new ftp site
-    ??? does not appear to have Rinex 2 files anymore ???
-    ??? goes they switched in 2020 .... ???
+    no longer supported - 
+
+    Parameters
+    ----------
+    station : str
+        4 character station ID, lowercase
+    year : int
+        full year
+    month : int
+        calendar month
+    day : integer
+        day of the month
+
     """
     crnxpath = hatanaka_version()
     teqcpath = teqc_version()
@@ -3915,17 +3485,24 @@ def rinex_ga_highrate(station, year, month, day):
 
 def highrate_nz(station, year, month, day):
     """
-    author: kristine larson
-    inputs: station name, year, month, day
-    picks up a RINEX file from GNS New zealand
-    you can input day =0 and it will assume month is day of year
-    you can also try this site - not coded up yet, but I think
-    the data stay there for a couple months for some sites.
-    ftp://ftp.geonet.org.nz/rtgps/rinex1Hz/PositioNZ/2021/062/
-    21sep02 - started to change from ftp to https - but did not finish
+    NO LONGER SUPPORTED 
+    picks up a high-rate RINEX 2.11 file from GNS New zealand
+    requires teqc to convert/merge the files
+
+    Parameters
+    ----------
+    station : str
+        station name
+    year : int
+        full year
+    month :  int
+        month or day of year
+    day : int
+        day or zero
+
     """
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    gns = 'ftp://ftp.geonet.org.nz/gnss/event.highrate/1hz/raw/' + cyyyy +'/' + cdoy + '/'
+    #gns = 'ftp://ftp.geonet.org.nz/gnss/event.highrate/1hz/raw/' + cyyyy +'/' + cdoy + '/'
     gns = 'https://data.geonet.org.nz/gnss/event.highrate/1hz/raw/' + cyyyy +'/' + cdoy + '/'
     print(gns)
     stationU=station.upper()
@@ -3936,6 +3513,11 @@ def highrate_nz(station, year, month, day):
     trimbleexe = exedir + '/runpkr00' 
     #teqc = exedir + '/teqc' 
     teqc = teqc_version()
+    if not os.path.exists(teqc):
+        print('teqc executable does not exist. Exiting')
+        print('This could be replaced with gfzrnx. Please submitting a pull request.')
+        sys.exit()
+         
     for h in range(0,24):
         # subdirectory
         chh = '{:02d}'.format(h)
@@ -3954,65 +3536,72 @@ def highrate_nz(station, year, month, day):
         except:
             print('some kind of problem with download',file1)
 
-def llh2xyz(lat,lon,height):
-    """
-    inputs lat,lon (in degrees) and height in meters
-    returns x,y,z in meters
-    # not sure where I got this
-    """
-    A_EARTH = 6378137;
-    f= 1/298.257223563;
-    NAV_E2 = (2-f)*f; # also e^2
-    deg2rad = math.pi/180.0
-
-    slat = math.sin(lat*deg2rad);
-    clat = math.cos(lat*deg2rad);
-    #    print(username,lat,slat)
-    r_n = A_EARTH/(math.sqrt(1 - NAV_E2*slat*slat))
-    x= (r_n + height)*clat*math.cos(lon*deg2rad)
-    y= (r_n + height)*clat*math.sin(lon*deg2rad)
-    z= (r_n*(1 - NAV_E2) + height)*slat
-    return x,y,z
 
 def get_orbits_setexe(year,month,day,orbtype,fortran):
     """
-    helper script to make snr files
-    takes year, month, day and orbit type
-    picks up and stores
-    also sets executable location (gpsonly vs gnss)
-    returns whether file was found, its name, the directory, and name of snrexe
-    20apr15:  check for xz compression
-    kristine larson
-    20sep04: fortran (boolean) sent as an input, so you know whether
-    to worry that the gpsSNR.e or gnssSNR.e executable does or does not exist
-    21nov05 added ultra
+    picks up and stores orbits as needed.
+    It also sets executable location for translation (gpsonly vs multignss)
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        calendar month
+    day : int
+        calendar day
+    orbtype : str
+        orbit source, e.g. nav, gps...
+    fortran : bool
+        whether you are using fortran code for translation
+
+    Returns
+    -------
+    foundit : bool
+        whether orbit file was found
+    f : str
+        name of the orbit file
+    orbdir : str
+        location of the orbit file
+    snrexe : str 
+        location of SNR executable. only relevant for fortran users
+
     """
     #default values
+    # if they ask for gnss or gnss3, always use rapid.
+    # at least for years 2022 and after
+    #if year >= 2022:
+    #    if (orbtype == 'gnss') or (orbtype == 'gnss3'):
+    #        orbtype = 'rapid'
+        #if orbtype == 'gbm':
+        #    orbtype = 'rapid'
+
     foundit = False
     f=''; orbdir=''
     # define directory for the conversion executables
     exedir = os.environ['EXE']
-    #warn_and_exit(snrexe)
-# removed Shanghai.  Something was amiss
-#    if orbtype == 'sha':
-#        # SHANGHAI multi gnss
-#        f,orbdir,foundit=getsp3file_mgex(year,month,day,'sha')
-#        snrexe = gnssSNR_version()
-#        warn_and_exit(snrexe,fortran)
     if (orbtype == 'grg'):
         # French multi gnss, but there are no Beidou results
         f,orbdir,foundit=getsp3file_mgex(year,month,day,'grg')
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif (orbtype == 'gfr'):
-        print('uses rapid GFZ orbits, avail as of 2021/137, now pointing to local GFZ directory ')
         f,orbdir,foundit=rapid_gfz_orbits(year,month,day)
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
+    elif (orbtype == 'rapid'):
+        f,orbdir,foundit=rapid_gfz_orbits(year,month,day)
+        snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
+    elif (orbtype == 'gnss3') or (orbtype == 'gnss-gfz'):
+        if (year >= 2024):
+            f,orbdir,foundit=newish_gfz_orbits(year,month,day,'final')
+        else:
+            f,orbdir,foundit=gbm_orbits_direct(year,month,day)
+        snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif (orbtype == 'sp3'):
-        print('uses default IGS orbits, so only GPS ?')
+        #print('uses default IGS orbits, so only GPS ?')
         f,orbdir,foundit=getsp3file_flex(year,month,day,'igs')
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif (orbtype == 'gfz'):
-        print('using gfz sp3 file, GPS and GLONASS') # though I advocate gbm
+        print('using Final gfz sp3 file, GPS and GLONASS') # though I advocate gbm
         f,orbdir,foundit=getsp3file_flex(year,month,day,'gfz')
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif (orbtype == 'igr'):
@@ -4024,13 +3613,20 @@ def get_orbits_setexe(year,month,day,orbtype,fortran):
         f,orbdir,foundit=getsp3file_flex(year,month,day,'igs') # use default
         snrexe = gnssSNR_version(); warn_and_exit(snrexe,fortran)
     elif (orbtype == 'gbm'):
-        # this uses GFZ multi-GNSS and is rapid, but not super rapid
+        # this uses GFZ multi-GNSS and is rapid, but not super rapid - but from CDDIS ... 
+        # having it look first at GFZ for this file, which has a different name
         f,orbdir,foundit=getsp3file_mgex(year,month,day,'gbm')
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif (orbtype == 'wum'):
         # this uses WUHAN multi-GNSS which is ultra, but is not rapid ??
         # but only hour 00:00
         f,orbdir,foundit=getsp3file_mgex(year,month,day,'wum')
+        snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
+    elif (orbtype == 'wum2'):
+        # Wuhan ultra-rapid orbit from the Wuhan FTP
+        # but only hour 00:00
+        ihr = 0
+        f,orbdir,foundit=get_wuhan_orbits(year,month,day,ihr)
         snrexe = gnssSNR_version() ; warn_and_exit(snrexe,fortran)
     elif orbtype == 'jax':
         # this uses JAXA, has GPS and GLONASS and appears to be quick and reliable
@@ -4042,10 +3638,6 @@ def get_orbits_setexe(year,month,day,orbtype,fortran):
         f,orbdir,foundit=getsp3file_flex(year,month,day,'esa')
         snrexe = gnssSNR_version(); 
         warn_and_exit(snrexe,fortran)
-    elif orbtype == 'nav':
-        #print('getting nav orbits ... i hope')
-        f,orbdir,foundit=getnavfile(year, month, day) # use default version, which is gps only
-        snrexe = gpsSNR_version() ; warn_and_exit(snrexe,fortran)
     elif orbtype == 'test':
         # i can't even remember this ... 
         print('getting gFZ orbits from CDDIS using test protocol')
@@ -4053,17 +3645,51 @@ def get_orbits_setexe(year,month,day,orbtype,fortran):
         snrexe = gnssSNR_version(); warn_and_exit(snrexe,fortran)
     elif orbtype == 'ultra':
         print('getting ultra rapid orbits from GFZ local machine')
-        f, orbdir, foundit = ultra_gfz_orbits(year,month,day,0)
+        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+        if (year + doy/365.25) > (2024 + 153/365.25):
+            # use new file structure and two day orbit ... 
+            #use hour 0
+            ihr = 0
+            if doy == 1:
+                # use december 31 from previous year
+                f, orbdir, foundit = new_ultra_gfz_orbits(year-1,12,31,ihr)
+            else:
+                # use previous day ... 
+                f, orbdir, foundit = new_ultra_gfz_orbits(year,doy-1,0,ihr)
+        else:
+            f, orbdir, foundit = ultra_gfz_orbits(year,month,day,0)
         snrexe = gnssSNR_version(); warn_and_exit(snrexe,fortran)
     else:
-        print('I do not recognize the orbit type you tried to use: ', orbtype)
+        if ('nav' in orbtype):
+            print('Requested a GPS only nav file')
+            if orbtype == 'nav':
+                f,orbdir,foundit=getnavfile(year, month, day) # use default version, which is gps only
+                snrexe = gpsSNR_version() ; warn_and_exit(snrexe,fortran)
+            if orbtype == 'nav-sopac':
+                f,orbdir,foundit=getnavfile_archive(year, month, day,'sopac') # use default version, which is gps only
+                snrexe = gpsSNR_version() ; warn_and_exit(snrexe,fortran)
+            if orbtype == 'nav-cddis':
+                f,orbdir,foundit=getnavfile_archive(year, month, day,'cddis') # use default version, which is gps only
+                snrexe = gpsSNR_version() ; warn_and_exit(snrexe,fortran)
+            if orbtype == 'nav-esa':
+                f,orbdir,foundit=getnavfile_archive(year, month, day,'esa') # use default version, which is gps only
+                snrexe = gpsSNR_version() ; warn_and_exit(snrexe,fortran)
+        else:
+            print('I do not recognize the orbit type you tried to use: ', orbtype)
 
+    print('\n')
     return foundit, f, orbdir, snrexe
 
 def warn_and_exit(snrexe,fortran):
     """
-    if snr executable does not exist, exit
-    2020sep04 - send it fortran boolean.  
+    if the GNSS/GPS to SNR executable does not exist, exit
+
+    Parameters
+    ----------
+    snrexe : str
+        name of the executable
+    fortran : bool
+        whether fortran is being used for translation
     """
     if not fortran:
         ok = 1
@@ -4075,336 +3701,128 @@ def warn_and_exit(snrexe,fortran):
             print('Install it or use -fortran False. Exiting')
             sys.exit()
 
-def quick_rinex_snrC(year, doy, station, option, orbtype,receiverrate,dec_rate,archive):
+def new_rinex3_rinex2(r3_filename,r2_filename,dec,gpsonly,log):
     """
-    inputs: year and day of year (integers) and station name
-    option is for the snr creation ??? integer or character?
-    orbtype can be nav or sp3.  if the former, then gpsSNR is used.
-    if the later, then gnssSNR
-    what are receiverrate and dec_rate defaults?
-    this assumes you follow my definitions for where things go,
-    i.e. REFL_CODE and ORBITS
-    it currently checks Unavco, SOPAC, and SONEL. I should add CDDIS
-    author: kristine m. larson
-    19may20, added decimation
-    19sep12, I got tired of code crashing for files > 20 observables.  I am thus using teqc
-    20apr15, xz compression added but also try to streamline it.
-    20jul10, added arvchive setting. default is 'all'
+    This code translates a RINEX 3 file into a RINEX 2.11 file.
+    It is assumed that the gfzrnx exists and that the RINEX 3 file is 
+    Hatanaka uncompressed or compressed. (ending in rnx or crx)
 
-    """
-    # define directory for the conversion executables
-    print('receiver rate:',receiverrate)
-    print('decimation: ', dec_rate)
-    print('archive: ', archive)
-    exedir = os.environ['EXE']
-    snrname_full, snrname_compressed, snre = define_and_xz_snr(station,year,doy,option)
-    if (snre == True):
-        print('snrfile already exists:', snrname_full)
-    else:
-        print('the snrfile does not exist ', snrname_full)
-        d = doy2ymd(year,doy); 
-        month = d.month; day = d.day
-        # new function to do the whole orbit thing
-        print(year,month,day,orbtype)
-        foundit, f, orbdir, snrexe = get_orbits_setexe(year,month,day,orbtype) 
-        # if you have the orbit file, you can get the rinex file
-        if foundit:
-            # now you can look for a rinex file
-            rinexfile,rinexfiled = rinex_name(station, year, month, day)
-            # This goes to find the rinex file. I am changing it to allow 
-            # an archive preference 
-             
-            go_get_rinex_flex(station,year,month,day,receiverrate,archive)
-# define booleans
-            oexist = os.path.isfile(orbdir + '/' + f) == True
-            rexist = os.path.isfile(rinexfile) == True
-            exc = exedir + '/teqc' 
-            texist = os.path.isfile(exc) == True
-            if rexist:
-                # and teqc executable exists, then 
-                # get rid of all the observables i do not need
-                if texist:
-                    print('teqc executable exists, so let us use it')
-                    foutname = 'tmp.' + rinexfile
-                    fout = open(foutname,'w')
-                    subprocess.call([exc, '-O.obs','S1+S2+S5+S6+S7+S8', '-n_GLONASS', '27', rinexfile],stdout=fout)
-                    fout.close()
-                # store it in the original rinex filename
-                    subprocess.call(['rm','-f',rinexfile])
-                    subprocess.call(['mv','-f',foutname, rinexfile])
-                # decimate this new rinex file
-                    if (rexist and dec_rate > 0): 
-                        print('decimate using teqc ', dec_rate, ' seconds')
-                        rinexout = rinexfile + '.tmp'; cdec = str(dec_rate)
-                        fout = open(rinexout,'w')
-                        subprocess.call([exc, '-O.dec', cdec, rinexfile],stdout=fout)
-                        fout.close() # needed?
-                        status = subprocess.call(['mv','-f', rinexout, rinexfile])
-            if (oexist and rexist):
-            #convert to SNR file
-                snrname = snr_name(station, year,month,day,option)
-                orbfile = orbdir + '/' + f
-                try:
-                    subprocess.call([snrexe, rinexfile, snrname, orbfile, str(option)])
-                    status = subprocess.call(['rm','-f', rinexfile ])
-                    print('xz compress the orbit files here')
-                    status = subprocess.call(['xz', orbfile])
-                except:
-                    print('no success making SNR file')
-                if os.path.isfile(snrname): 
-#                make sure it exists and is non-zero size before moving it
-                    if (os.stat(snrname).st_size == 0):
-                        print('you created a zero file size which could mean a lot of things')
-                        print('bad exe, bad snr option, do not really have the orbit file')
-                        status = subprocess.call(['rm','-f', snrname ])
-                    else:
-                        print('a SNR file was created and it is non-zero in length')
-                        print(snrname_full)
-                        store_snrfile(snrname,year,station) 
-            else:
-                print('Either the rinex file or orbit file does not exist, so there is nothing to convert')
 
-def go_get_rinex(station,year,month,day,receiverrate):
-    """
-    function to do the dirty work of getting a rinex file
-    inputs station name, year, month, day
+    Parameters
+    ----------
+    r3_filename : str
+         RINEX 3 format filename. Either Hatanaka 
+         compressed or uncompressed allowed, but not if it is gzipped.
+         The file extensions are crx or rnx.
+    r2_filename : str
+         RINEX 2.11 file
+    dec : integer
+        decimation factor. If 0 or 1, no decimation is done.
+    gpsonly : bool
+        whether you want only GPS signals. Default is false
+    log : fileiD
+        this must have been defined before you call this code
 
-    21mar17
-    cddis puts out very large screen outputs.  when trying to meld this
-    with jupyter notebooks, we had difficulties. cddis can still be 
-    accessed directly, but we are removing it from the "default" list
-    """
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    if (os.path.isfile(rinexfile) == True):
-        print('RINEX file exists')
-    else:
-        if receiverrate == 'low':
-            #print('seeking low rate at unavco')
-            rinex_unavco(station, year, month, day)
-        else:
-            #print('seeking high rate at unavco')
-            rinex_unavco_highrate(station, year, month, day)
-        if os.path.isfile(rinexfile):
-            okok = 1
-            #print('you now have the rinex file')
-        else:
-          # only keep looking if you are seeking lowrate data
-            if receiverrate == 'low':
-                try:
-                    rinex_sopac(station, year, month, day)
-                except:
-                    print('SOPAC did not work')
-                #if not os.path.isfile(rinexfile):
-                #    try:
-                #        rinex_cddis(station, year, month, day)
-                #    except:
-                #        print('CDDIS did not work')
-                if not os.path.isfile(rinexfile):
-                    try:
-                        rinex_sonel(station, year, month, day)
-                    except:
-                        print('SONEL did not work')
-                if not os.path.isfile(rinexfile):
-                    print('no RINEX')
-#
-def go_get_rinex_flex(station,year,month,day,receiverrate,archive):
-    """
-    function to do the dirty work of getting a rinex file
-    inputs station name, year, month, day
-    20jul10 preferred RINEX archive can be set (all is everything)
-    added geoscience australia and nz archives
-    2020aug28 added NGS, aka big_Disk_in_DC
-    2020nov28 added NRCAN
-    2021mar23 added special archive for reflectometry files at unavco
-    2021apr20 added BEV archive
-    """
-    if (day == 0):
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    Returns
+    -------
+    fexists : bool
+        whether the RINEX 2.11 file was created and exists
 
-    #print('Requested data rate: ', receiverrate)
-    rinexfile,rinexfiled = rinex_name(station, year, month, day)
-#    print('Name of the rinexfile should be:', rinexfile)
-#    print('Archive',archive)
-
-    if (os.path.isfile(rinexfile) == True):
-        ignoreFornow = 1
-        #print('RINEX file exists')
-    else:
-        if receiverrate == 'high':
-            if (archive == 'unavco') or (archive == 'all'):
-                #print('seeking high rate data at UNAVCO ')
-                rinex_unavco_highrate(station, year, month, day)
-            if not os.path.isfile(rinexfile):  
-                if (archive == 'nrcan') or (archive == 'all'):
-                #print('seeking high rate data at NRCAN ')
-                    rinex_nrcan_highrate(station, year, month, day)
-            if not os.path.isfile(rinexfile):
-                if (archive == 'ga') or (archive == 'all'):
-                #print('seeking high rate data at GA')
-                    rinex_ga_highrate(station, year, month, day)
-        else:
-          # lowrate data
-            if archive == 'all':
-                #print('will search four archives for your file')
-                # use the old code
-                go_get_rinex(station,year,month,day,receiverrate) 
-            else:
-                if archive == 'unavco':
-                    rinex_unavco(station, year, month, day)
-                elif (archive == 'special'):
-                    rinex_special(station, year, month, day)
-                elif (archive == 'sopac'):
-                    rinex_sopac(station, year, month, day)
-                elif (archive == 'cddis'):
-                    rinex_cddis(station, year, month, day)
-                elif (archive == 'sonel'):
-                    rinex_sonel(station, year, month, day)
-                elif (archive == 'nz'):
-                    rinex_nz(station, year, month, day)
-                elif (archive == 'ga'):
-                    rinex_ga_lowrate(station,year,month,day)
-                elif (archive == 'bkg'):
-                    rinex_bkg(station,year,month,day)
-                elif (archive == 'nrcan'):
-                    rinex_nrcan(station,year,month,day)
-                elif (archive == 'jeff'):
-                    pickup_pbay(year,month,day)
-                elif (archive == 'ngs'):
-                    # changed 2021 august 28 to use https instead of ftp
-                    new_big_Disk_in_DC(station, year,month,day)
-                elif (archive == 'bev'):
-                    bev_rinex2(station, year, doy)
-                elif (archive == 'jp'):
-                    # thank you to naoya kadota for writing this 
-                    rinex_jp(station, year, month, day)
-                else:
-                    print('eek - I have run out of archives')
-
-def new_rinex3_rinex2(r3_filename,r2_filename):
-    """
-    takes as input the names of a rinex3 file and a rinex2 file
-    code checks that gfzrnx executable exists
-    this does multi-GNSS
-    2021nov14 checks for gz files too
-    will translate Hatanaka.  Maintains initial rinex3 file.
-    does not store anything. Everything stays where it was 
     """
     fexists = False
     gexe = gfz_version()
     crnxpath = hatanaka_version()
-    #lastbit =  r3_filename[-6:]
-    if r3_filename[-3:] == 'crx':
+    lastbit =  r3_filename[-3:]
+    gobblygook = myfavoriteobs()
+    gobblygook_gps = myfavoritegpsobs()
+
+    if not os.path.exists(gexe):
+        log.write('gfzrnx executable does not exist and this file cannot be translated. Exiting \n')
+        sys.exit()
+    if not os.path.exists(r3_filename):
+        log.write('RINEX 3 inputfile does not exist:  {0:s}  Exiting.\n'.format(r3_filename))
+        return fexists
+
+    if (lastbit == 'rnx'):
+        log.write('found Hatanaka decompressed version {0:s} \n'.format(r3_filename))
+        r3_filename_new = r3_filename
+    elif (lastbit == 'crx'):
+        log.write('found Hatanaka compressed version {0:s} \n'.format(r3_filename))
+        #print('found Hatanaka compressed version', r3_filename)
+        r3_filename_new = r3_filename[0:-3] + 'rnx'
         if not os.path.exists(crnxpath):
-            print('You need to install Hatanaka translator. Exiting.')
-            sys.exit()
-        r3_filename_new = r3_filename[0:35] + 'rnx'
-        print('Converting to Hatanaka compressed to uncompressed')
+            log.write('You need to install Hatanaka translator. Exiting.\n')
+            return fexists
+        s1=time.time()
         subprocess.call([crnxpath, r3_filename])
+        s2=time.time()
+        print(round(s2-s1,2), ' seconds')
         # removing the compressed version - will keep new version
         subprocess.call(['rm', '-f', r3_filename ])
-        # now swap name
-        r3_filename = r3_filename_new
-    # these are my favorite observables
-    gobblygook = 'G:S1C,S2X,S2L,S2S,S5+R:S1P,S1C,S2P,S2C+E:S1,S5,S6,S7,S8+C:S2C,S7C,S2I,S7I'
-    if not os.path.exists(gexe):
-        print('gfzrnx executable does not exist and this file cannot be translated')
-    else:
-        if os.path.isfile(r3_filename):
-            try:
-                subprocess.call([gexe,'-finp', r3_filename, '-fout', r2_filename, '-vo','2','-ot', gobblygook, '-f'])
-                if os.path.exists(r2_filename):
-                    #print('look for the rinex 2.11 file here: ', r2_filename)
-                    fexists = True
-                else:
-                    sigh = 0
-            except:
-                print('some kind of problem in translation from RINEX 3 to RINEX 2.11')
+        if os.path.exists(r3_filename_new):
+            log.write('Hatanaka Conversion successful {0:s} \n'.format(r3_filename_new))
         else:
-            print('RINEX 3 file does not exist', r3_filename)
-
-
-    return fexists
-
-def cddis_rinex3(station9ch, year, doy,srate,orbtype):
-    """
-    attempt to download Rinex3 files from CDDIS
-    and then translate them to something useful (Rinex 2.11)
-
-    inputs: 9 character station name (should be all capitals)
-    year, day of year (doy) and sample rate (in seconds)
-    station9ch can be lower or upper case - code changes it to upper case
-
-    sending orbit type so that if nav file is used, no point writing out the non-GPS data
-
-    returns file existence boolean and name of the RINEX 3 file (so it can be cleaned up)
-    author: kristine larson
-    """
-    fexists = False 
-    ftp = 'ftp://cddis.nasa.gov/gnss/data/daily/'
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    cyyyy = str(year)
-
-    f = cyyyy + '/' + cdoy + '/' + cyy + 'd'  + '/'
-    new_way_f = '/gnss/data/daily/' + f
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + str(srate) + 'S_MO'
-    smallff = station9ch[0:4].lower() + cdoy + '0.' + cyy + 'o'
-    ending = '.crx' # compressed rinex3 ending
-    rending = '.rnx' # rinex3 ending
-    gzfilename = ff+ending + '.gz' # the crx.gz file
-    filename = ff+ending  # the crx file
-    rfilename = ff+rending # the rnx file
-    url = ftp + f + gzfilename  
-    #print(url)
-    # not sure i still neeed this
-    #exedir = os.environ['EXE']
-    gexe = gfz_version()
-    crnxpath = hatanaka_version()
-    if orbtype == 'nav':
-        # added this bevcause weird Glonass data were making teqc unhappy
-        gobblygook = 'G:S1C,S2X,S2L,S2S,S5'
+            log.write('RINEX 3 file does not exist \n')
     else:
-    # I hate S2W 
-    # tried to add Beidou on September 19, 2020
-        gobblygook = 'G:S1C,S2X,S2L,S2S,S5+R:S1P,S1C,S2P,S2C+E:S1,S5,S6,S7,S8+C:S2C,S7C,S2I,S7I'
-    print(gobblygook)
-    if os.path.isfile(rfilename):
-        print('rinex3 file already exists')
+        log.write('I found neither a rnx or crx RINEX 3 file and those are the only ones allowed. Exiting \n')
+        return fexists
+
+    #print('decimate value: ', dec)
+    s1=time.time()
+    if os.path.exists(r3_filename_new):
+        log.write('Now Convert from RINEX 3 to RINEX 2.11\n')
+        if True:
+            if (dec == 1) or (dec == 0):
+                if (gpsonly):
+                    subprocess.call([gexe,'-finp', r3_filename_new, '-fout', r2_filename, '-vo','2','-ot', gobblygook_gps, '-f','-q'])
+                else:
+                    subprocess.call([gexe,'-finp', r3_filename_new, '-fout', r2_filename, '-vo','2','-ot', gobblygook, '-f','-q'])
+                    #subprocess.call([gexe,'-finp', r3_filename, '-fout', r2_filename, '-vo','2','-ot', gobblygook, '-f','-q'])
+                    #'-sei','out','-smp',crate
+            else:
+                crate = str(dec)
+                if (gpsonly):
+                    subprocess.call([gexe,'-finp', r3_filename_new, '-fout', r2_filename, '-vo','2','-ot', gobblygook_gps, '-sei','out','-smp', crate, '-f','-q'])
+                else:
+                    subprocess.call([gexe,'-finp', r3_filename_new, '-fout', r2_filename, '-vo','2','-ot', gobblygook, '-sei','out','-smp', crate, '-f','-q'])
+        #except:
+        #    print('Some kind of problem in translation from RINEX 3 to RINEX 2.11')
     else:
-        print(gzfilename)
-        print(new_way_f)
-        try:
-            cddis_download(gzfilename,new_way_f)
-            subprocess.call(['gunzip',gzfilename])
-            subprocess.call([crnxpath,filename])
-            subprocess.call(['rm',filename])
-        except:
-            print('no file at CDDIS')
+        log.write('RINEX 3 file I need does not exist, so no translation {0:s} \n'.format( r3_filename_new))
 
-    # try using my newfunction  
-    r2_filename = smallff
-    fexists = new_rinex3_rinex2(rfilename,r2_filename)
-    #if os.path.isfile(rfilename) and os.path.isfile(gexe):
-    #    print('making rinex 2.11')
-    #    try:
-    #        subprocess.call([gexe,'-finp', rfilename, '-fout', smallff, '-vo','2','-ot', gobblygook, '-f'])
-    #        print('woohoo!')
-    #        print('look for the rinex 2.11 file here: ', smallff)
-    #        fexists = True
-    #    except:
-    #        print('some kind of problem in translation to 2.11')
-    #else:
-    #    print('either the rinex3 file does not exist OR the gfzrnx executable does not exist')
+    s2=time.time()
 
-    return fexists, rfilename
+    if os.path.exists(r2_filename):
+        log.write('The RINEX 2.11 file now exists: {0:s} \n'.format(r2_filename))
+        fexists = True
+    else:
+        log.write('The RINEX 2.11 file does not exist: {0:s} \n'.format(r2_filename))
+
+
+    #print('remove RINEX3 rnx version of the file ',r3_filename_new)
+    subprocess.call(['rm', '-f', r3_filename_new ])
+
+    return fexists 
+
 
 def ign_orbits(filename, directory,year):
     """
-    inputs are filename of MGEX sp3 and directory at IGN
+    Downloads sp3 files from the IGN archive
+
+    Parameters
+    ----------
+    filename : str
+        name of the sp3 file
+    directory : str
+        location of orbits at the IGN
+    year : int
+        full year
+
+    Returns
+    -------
+    foundit : bool
+        whether sp3 file was found
+
     """
     # without gz
     stripped_name = filename[0:-3]
@@ -4423,139 +3841,32 @@ def ign_orbits(filename, directory,year):
     return foundit 
 
 
-def bkg_rinex3(station9ch, year, doy,srate):
-    """
-    download rinex 3 from BKG
-    inputs: 9 character station name, year, day of year and srate  
-    is sample rate in seconds
-    note: this code works - but it does not turn it into RINEX 2 for you
-
-    21sep03 moved from ftp to https
-    """
-    fexist = False
-    crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-
-    url = 'ftp://igs.bkg.bund.de/EUREF/obs/' + cyyyy + '/' + cdoy + '/'
-    # try this one now?
-    url = 'https://igs.bkg.bund.de/root_ftp/EUREF/obs/' + cyyyy + '/' + cdoy + '/' 
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
-    ff1 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx'
-    ff2 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.rnx'
-    url = url + ff
-    #print(url)
-    try:
-        wget.download(url,ff)
-        subprocess.call(['gunzip',ff])
-        subprocess.call([crnxpath,ff1])
-        # get rid of compressed file
-        subprocess.call(['rm','-f',ff1])
-    except:
-        print('problem with bkg download')
-
-    if os.path.exists(ff2):
-        fexist = True
-
-    return fexist 
-
-def bev_rinex2(station, year, doy):
-    """
-    download rinex 2.11 from BEV
-    inputs: station name, year, day of year 
-    """
-    fexist = False
-    crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    cyyyy = str(year)
-    url = 'ftp://gnss.bev.gv.at/pub/obs/' + cyyyy + '/' + cdoy + '/'
-    ff_Z =  station + cdoy + '0.' + cyy + 'd' + '.Z'
-    ff_gz = station + cdoy + '0.' + cyy + 'd' + '.gz'
-    ff1 = station + cdoy + '0.' + cyy + 'd' 
-    ff2 = station + cdoy + '0.' + cyy + 'o' 
-    # if hatanaka decompression exe does not exist, exit early
-    if not os.path.exists(crnxpath):
-        hatanaka_warning()
-        return fexist
-
-    # illegal Z files ...  only look for gz files
-    #try:
-    #    this_url = url + ff_Z
-    #    wget.download(this_url,ff_Z)
-        # subprocess.call(['uncompress',ff_Z])
-        # subprocess.call([crnxpath,ff1])
-    #except:
-    #    print('no luck first try')
-
-
-    #if os.path.exists(ff_Z):
-    #    print('yippee')
-    try:
-        this_url = url + ff_gz
-        wget.download(this_url,ff_gz)
-        subprocess.call(['gunzip',ff_gz])
-        subprocess.call([crnxpath,ff1])
-    except:
-        print('no luck ')
-
-    # get rid of Hatanaka file
-    if os.path.exists(ff1):
-        subprocess.call(['rm','-f',ff1])
-
-    if os.path.exists(ff2):
-        fexist = True
-
-    return fexist
-
-def bev_rinex3(station9ch, year, doy,srate):
-    """
-    download rinex 3 from BEV
-    inputs: 9 character station name, year, day of year and srate
-    is sample rate in seconds
-    note: this code works - but it does not turn it into RINEX 2 for you
-    """
-    fexist = False
-    crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-    url = 'ftp://gnss.bev.gv.at/pub/obs/' + cyyyy + '/' + cdoy + '/'
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
-    ff1 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx'
-    ff2 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.rnx'
-    url = url + ff
-    #print(url)
-    try:
-        wget.download(url,ff)
-        subprocess.call(['gunzip',ff])
-        subprocess.call([crnxpath,ff1])
-        # get rid of compressed file
-        subprocess.call(['rm','-f',ff1])
-    except:
-        print('problem with IGS download')
-
-    if os.path.exists(ff2):
-        fexist = True
-
-    return fexist
-
 def ign_rinex3(station9ch, year, doy,srate):
     """
-    download rinex 3 from IGN
-    inputs: 9 character station name, year, day of year and srate
-    is sample rate in seconds
-    note: this code works - but it does not turn it into RINEX 2 for you
+    Downloads a RINEX 3 file from IGN
+
+    Parameters
+    ----------
+    station9ch : str
+        9 character station name
+    year : int
+        full year
+    doy : int
+        day of year 
+    srate : int
+        sample rate
+
+    Returns
+    -------
+    fexist : bool
+        whether file was downloaded
     """
     fexist = False
     crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
+    cyyyy, cyy, cdoy = ydoych(year,doy)
+
     csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
+
     url = 'ftp://igs.ensg.ign.fr/pub/igs/data/' + cyyyy + '/' + cdoy + '/'
     ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
     ff1 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx'
@@ -4569,128 +3880,23 @@ def ign_rinex3(station9ch, year, doy,srate):
         # get rid of compressed file
         subprocess.call(['rm','-f',ff1])
     except:
-        print('problem with IGS download')
+        print('problem with IGN download')
 
     if os.path.exists(ff2):
         fexist = True
 
     return fexist
 
-def ga_rinex3(station9ch, year, doy,srate):
-    """
-    download rinex 3 from Geoscience Australia
-    inputs: 9 character station name, year, day of year and srate
-    is sample rate in seconds
-    note: this code works - but it does not turn it into RINEX 2 for you
-    21sep02 failed attempt to update to https
-    """
-    fexist = False
-    crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-    url = 'ftp://ftp.data.gnss.ga.gov.au/daily/' + cyyyy + '/' + cdoy + '/'
-    #url = 'https://data.gnss.ga.gov.au/daily/' + cyyyy + '/' + cdoy + '/'
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
-    ff1 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx'
-    ff2 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.rnx'
-    url = url + ff
-    print(url)
-    try:
-        wget.download(url,ff)
-        subprocess.call(['gunzip',ff])
-        subprocess.call([crnxpath,ff1])
-        # get rid of compressed file
-        subprocess.call(['rm','-f',ff1])
-    except:
-        print('problem with geoscience australia download')
-
-
-    if os.path.exists(ff2):
-        fexist = True
-
-    return fexist
-
-def ga_rinex3_to_rinex2(station9ch, year, doy,srate):
-    """
-    download rinex 3 from Geoscience Australia and translte to rinex 2
-    inputs: 9 character station name, year, day of year and srate
-    seconds
-    kristine larson
-    """
-    fexist = False
-    crnxpath = hatanaka_version()
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-    url = 'ftp://ftp.data.gnss.ga.gov.au/daily/' + cyyyy + '/' + cdoy + '/'
-
-    ff = station9ch.upper() +    '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx.gz'
-    ff1 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.crx'
-    ff2 = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO' + '.rnx'
-    url = url + ff
-    print(url)
-    rinex2name = station9ch[0:4].lower() + cdoy + '0.' + cyy + 'o'
-    try:
-        wget.download(url,ff)
-        subprocess.call(['gunzip',ff])
-        if os.path.exists(ff1):
-            print('uncompress Hatanaka')
-            subprocess.call([crnxpath,ff1])
-        else:
-            print('compressed file does not exist')
-        if os.path.exists(ff2):
-            print(ff2, rinex2name)
-            fexist = new_rinex3_rinex2(ff2,rinex2name)
-    except:
-        print('problem with geoscience australia download')
-
-    # returns rinex3name by convention
-    return fexist, ff2 
-
-def rinex3_rinex2(gzfilename,v2_filename):
-    """
-    input gzfile name
-    gunzip, de-hatanaka, then convert to RINEX 2.11
-    returns whether the rinex2file exists
-    this is GPS only
-    """
-    fexists = False
-    gexe = gfz_version()
-    hexe = hatanaka_version()
-    # I hate S2W for this version, only GPS
-    # / OBS TYPES AUBG claims to have these
-    # S1C   S2S S2W S5Q
-    gobblygook = 'G:S1C,S5'
-    gobblygook = 'G:S1C,S2X,S2L,S2S,S5'
-    l=len(gzfilename)
-    cnxfilename = gzfilename[0:l-3]
-    rnxfilename = gzfilename[0:l-6] + 'rnx'
-    #print(gzfilename)
-    #print(cnxfilename)
-    #print(rnxfilename)
-    if os.path.isfile(gzfilename):
-        print('unzip and Hatanaka decompress')
-        subprocess.call(['gunzip',gzfilename])
-        subprocess.call([hexe,cnxfilename])
-    if os.path.isfile(rnxfilename) and os.path.isfile(gexe):
-        print('making rinex 2.11 of this file')
-        try:
-            subprocess.call([gexe,'-finp', rnxfilename, '-fout', v2_filename, '-vo','2','-ot', gobblygook, '-f'])
-            print('look for the rinex 2.11 file here: ', v2_filename)
-            fexists = True
-        except:
-            print('some kind of problem in translation to 2.11')
-    else:
-        print('either the rinex3 file does not exist OR the gfzrnx executable does not exist')
-
-    return fexists
 
 def hatanaka_version():
     """
-    return string with location of hatanaka executable
+    Finds the Hatanaka decompression executable
+
+    Returns
+    -------
+    hatanakav : str 
+        name/location of hatanaka executable
+
     """
     exedir = os.environ['EXE']
     hatanakav = exedir + '/CRX2RNX'
@@ -4701,7 +3907,13 @@ def hatanaka_version():
 
 def gfz_version():
     """
-    return string with location of gfzrnx executable
+    Finds location of the gfzrnx executable
+
+    Returns
+    -------
+    gfzv : str
+        name/location of gfzrnx executable
+
     """
     exedir = os.environ['EXE']
     gfzv = exedir + '/gfzrnx'
@@ -4712,7 +3924,12 @@ def gfz_version():
 
 def gpsSNR_version():
     """
-    return string with location of gpsSNR executable
+    Finds location of the gps to SNR executable
+
+    Returns
+    -------
+    gpse : str
+        location of gpsSNR executable
     """
     exedir = os.environ['EXE']
     gpse = exedir + '/gpsSNR.e'
@@ -4723,7 +3940,13 @@ def gpsSNR_version():
 
 def gnssSNR_version():
     """
-    return string with location of gnssSNR executable
+    Finds location of the GNSS to SNR executable
+
+    Returns
+    -------
+    gpse : str 
+        location of gnssSNR executable
+
     """
     exedir = os.environ['EXE']
     gpse = exedir + '/gnssSNR.e'
@@ -4734,8 +3957,13 @@ def gnssSNR_version():
 
 def teqc_version():
     """
-    return string with location of teqcexecutable
-    author: kristine larson
+    Finds location of the teqc executable
+
+    Returns
+    -------
+    gpse : str
+        location of teqc executable
+
     """
     exedir = os.environ['EXE']
     gpse = exedir + '/teqc'
@@ -4746,129 +3974,119 @@ def teqc_version():
 
 def snr_exist(station,year,doy,snrEnd):
     """
-    given station name, year, doy, snr type
-    returns whether snr file exists on your machine
-    bizarrely snrEnd is a character string
-    year and doy are integers, which makes sense!
-    author: Kristine Larson
+    check to see if the SNR file already exists
+    uncompresses if necessary (gz or xz)
+
+    Parameters
+    ----------
+    station : str
+        four character station name
+    year : int
+        full year
+    doy : int
+        day of year
+    snrEnd : str
+        2 character snr type, i.e. 66, 99
+
+    Returns
+    -------
+    snre : boolean
+        whether SNR file exists. 
 
     """
     xdir = os.environ['REFL_CODE']
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
+    cyyyy, cyy, cdoy = ydoych(year,doy)
+
     f= station + cdoy + '0.' + cyy + '.snr' + snrEnd
-    fname = xdir + '/' + str(year) + '/snr/' + station + '/' + f
-    fname2 = xdir + '/' + str(year) + '/snr/' + station + '/' + f  + '.xz'
+    fname = xdir + '/' + cyyyy + '/snr/' + station + '/' + f
+    fname2 = xdir + '/' + cyyyy + '/snr/' + station + '/' + f  + '.xz'
+    fname3 = xdir + '/' + cyyyy + '/snr/' + station + '/' + f  + '.gz'
     snre = False
     # check for both
     if os.path.isfile(fname):
         snre = True
-    if os.path.isfile(fname2):
-        snre = True
+    if os.path.isfile(fname2) and (not snre):
+        snre = True # but needs to be uncompressed
+        subprocess.call(['unxz', fname2])
+    if os.path.isfile(fname3) and (not snre):
+        snre = True # but needs to be ungzipped 
+        #subprocess.call(['gunzip', fname3])
+        #TS - Removed this line Aug 2023 to stop unecessary decompression in nmea2snr
 
     return snre 
 
-
-def unavco_rinex3(station9ch, year, doy,srate,orbtype):
+def get_sopac_navfile_cron(yyyy,doy):
     """
-    attempt to download Rinex3 files from UNAVCO
-    and then translate them to something useful (Rinex 2.11)
-    inputs: 9 character station name (can be upper or lower, as code will change to all 
-    uppercase)
+    downloads navigation file from SOPAC to be used in a cron job
 
-    year, day of year (doy) and sample rate (in seconds)
+    Parameters
+    ----------
+    yyyy : int
+        full year
+    doy : int
+        day of year
 
-    orbtype - nav, sp3 etc
+    Returns
+    -------
+    filefound : bool
+        whether file is found
 
-    if nav file orbtype is used, no point writing out the non-GPS data
-
-    returns file existence boolean and name of the RINEX 3 file (so it can be cleaned up)
-
-
-    warning - i do not write out the L2P data - only the good L2C signals.
-
-    21sep02 -change from ftp to https
-
-    author: kristine larson
     """
-    fexists = False 
+    filefound = False
+    cyyyy = str(yyyy)
+    cyy = cyyyy[2:4]
     cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-    ftp = 'ftp://data-out.unavco.org/pub/rinex3/obs/' 
-    # updated 21sep03
-    ftp = 'https://data.unavco.org/archive/gnss/rinex3/obs/'
 
-    f = cyyyy + '/' + cdoy + '/' 
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO'
-    smallff = station9ch[0:4].lower() + cdoy + '0.' + cyy + 'o'
-    ending = '.crx' # compressed rinex3 ending
-    rending = '.rnx' # rinex3 ending
-    gzfilename = ff+ending + '.gz' # the crx.gz file
-    filename = ff+ending  # the crx file
-    rfilename = ff+rending # the rnx file
-    url = ftp + f + gzfilename  
-#    print(url)
-    # not sure i still neeed this
-    exedir = os.environ['EXE']
-    gexe = gfz_version()
-    crnxpath = hatanaka_version()
-    if (orbtype == 'nav') or (orbtype == 'gps'):
-        # added this because weird Glonass data were making teqc unhappy
-        gobblygook = 'G:S1C,S2X,S2L,S2S,S5'
-    else:
-    # I hate S2W  - so it is not written out
-    # added Beidou 9/20/2020
-        gobblygook = 'G:S1C,S2X,S2L,S2S,S5+R:S1P,S1C,S2P,S2C+E:S1,S5,S6,S7,S8+C:S2C,S7C,S2I,S7I'
-    print(gobblygook)
-    if os.path.isfile(rfilename):
-        print('rinex3 file already exists')
-    else:
-        try:
-            wget.download(url,gzfilename)
-            # unzip and Hatanaka decompress
-            subprocess.call(['gunzip',gzfilename])
-            subprocess.call([crnxpath,filename])
-            # remove the crx file
-            subprocess.call(['rm',filename])
-        except:
-            print('no RINEX 3 file at unavco')
+    sopac = 'ftp://garner.ucsd.edu'
+    # regular unix compressed file
+    navfile =  'auto' + cdoy + '0.' + cyy + 'n'
+    navfile_sopac1 =  navfile + '.Z' 
 
-    # use new function
-    if os.path.isfile(rfilename) and os.path.isfile(gexe):
-        r2_filename = smallff
-        fexists = new_rinex3_rinex2(rfilename,r2_filename)
-        #print('making rinex 2.11')
-        #try:
-            #subprocess.call([gexe,'-finp', rfilename, '-fout', smallff, '-vo','2','-ot', gobblygook, '-f'])
-            #print('woohoo!')
-            #print('look for the rinex 2.11 file here: ', smallff)
-            #fexists = True
-        #except:
-            #print('some kind of problem in translation to 2.11')
-    else:
-        print('either the rinex3 file does not exist OR the gfzrnx executable does not exist')
+    url_sopac1 = sopac + '/pub/rinex/' + cyyyy + '/' + cdoy + '/' + navfile_sopac1
 
-    return fexists, rfilename
+    try:
+        wget.download(url_sopac1,navfile_sopac1)
+        subprocess.call(['uncompress',navfile_sopac1])
+    except:
+        okokok = 1
+
+    if os.path.exists(navfile):
+        filefound = True
+    else:
+        print('Corrupted file/download failures at SOPAC')
+        subprocess.call(['rm','-f',navfile_sopac1])
+        subprocess.call(['rm','-f',navfile])
+
+    return filefound 
+
 
 def get_sopac_navfile(navfile,cyyyy,cyy,cdoy):
     """
-    kristine larson
-    tries to download nav file from SOPAC 
+    downloads navigation file from SOPAC 
+
+    Parameters
+    ----------
+    navfile : string
+        name of GPS broadcast orbit file
+    cyyyy : string
+        4 char year
+    cyy : string
+        2 char year
+    cdoy : string
+        3 char day of year
+
+    Returns 
+    -------
+    navfile : string 
+        should be the same name as input. not logical!
+        I have no idea why i did it this way.
 
     """
+    foundfile = False
     sopac = 'ftp://garner.ucsd.edu'
     navfile_sopac1 =  navfile   + '.Z' # regular nav file
     navfile_compressed = navfile_sopac1
     url_sopac1 = sopac + '/pub/rinex/' + cyyyy + '/' + cdoy + '/' + navfile_sopac1
-
-    # sometimes it is not compressed ... but I am going to ignore these times
-    navfile_sopac2 =  navfile
-    url_sopac2 = sopac + '/pub/rinex/' + cyyyy + '/' + cdoy + '/' + navfile_sopac2
-
-    #print(url_sopac1)
-    #print(url_sopac2)
 
 
     try:
@@ -4876,122 +4094,181 @@ def get_sopac_navfile(navfile,cyyyy,cyy,cdoy):
         subprocess.call(['uncompress',navfile_compressed])
     except:
         okokok = 1
-    #except Exception as err:
-    #    print(err)
+
+    if os.path.exists(navfile):
+        foundfile = True
+    else:
+        print('Corrupted file/download failures at SOPAC')
+        subprocess.call(['rm','-f',navfile_compressed])
+        subprocess.call(['rm','-f',navfile])
 
     return navfile
 
+def get_esa_navfile(cyyyy,cdoy):
+    """
+
+    downloads GPS broadcast navigation file from ESA
+    tries both Z and gz compressed
+
+    Parameters
+    ----------
+    cyyyy : str
+        4 char year
+    cdoy : str
+        3 char day of year
+
+    Returns
+    -------
+    fstatus : bool
+        whether file was found or not
+
+    """
+    fstatus = False
+    cyy = cyyyy[2:4]
+    year = int(cyyyy)
+    navfile_out = 'auto' + cdoy + '0.' + cyy + 'n' 
+
+    esa = 'ftp://gssc.esa.int/gnss/data/daily/' + cyyyy + '/brdc/'
+    # what we want to find
+    navfile = 'brdc' + cdoy + '0.' + cyy + 'n' 
+    # have to check both Z and gz because ...
+    navfilegz = 'brdc' + cdoy + '0.' + cyy + 'n.gz' 
+    #print(esa+navfilegz)
+    navfileZ = 'brdc' + cdoy + '0.' + cyy + 'n.Z' 
+
+    # this is when they switched to gzip... 
+    # brdc3350.20n.gz
+    tday = year + int(cdoy)/365.25
+    dday = 2020 + 335/365.25
+
+    navfile_url =  esa + navfilegz
+
+    # try gzip
+    if (tday >= dday):
+        try:
+            wget.download(navfile_url,navfilegz)
+            subprocess.call(['gunzip',navfilegz])
+        except:
+            print('Did not find gzip version')
+
+    # try Z version
+    if not os.path.exists(navfile):
+        navfile_url =  esa + navfileZ
+        try:
+            wget.download(navfile_url,navfileZ)
+            subprocess.call(['uncompress',navfileZ])
+        except:
+            okokok = 1
+
+    # rename it.
+    if os.path.exists(navfile):
+        subprocess.call(['mv',navfile, navfile_out])
+        fstatus = True
+    else:
+        print('No file was found at ESA')
+
+    return fstatus
+
 def get_cddis_navfile(navfile,cyyyy,cyy,cdoy):
     """
-    kristine larson
-    inputs navfile name with character string verisons of year, 2ch year and doy
-    tries to download from CDDIS archive
+    Tries to download navigation file from CDDIS
+    Renames it to my convention (auto0010.22n)
 
-    20jun11, implemented new CDDIS security requirements
-    21jan06, gz instead of Z
+    Parameters
+    ----------
+    navfile : str
+        name of GPS broadcast orbit file
+    cyyyy : str
+        4 char year
+    cyy : str
+        2 char year
+    cdoy : str
+        3 char day of year
+
+    Returns
+    -------
+    navfile : str
+        full path of the stored navigation file
+
     """
-    # ths old way
-    # just in case you sent it the navfile with auto instead of brdc
-    #cddisfile = 'brdc' + navfile[4:] + '.Z'
-    #cddis = 'ftp://cddis.nasa.gov'
-    # navfile will continue to be called auto
-    #navfile_compressed = cddisfile
 
-    # new way
     cddisfile = 'brdc' + cdoy + '0.' +cyy  +'n'
     cddisfile_compressed = cddisfile + '.Z'
     cddisfile_gzip = cddisfile + '.gz'
     # where the file should be at CDDIS ....
     mdir = '/gps/data/daily/' + cyyyy + '/' + cdoy + '/' +cyy + 'n/'
 
-    try:
-        cddis_download(cddisfile_compressed,mdir)
+    foundit = False
+    # they used to use Z compression
+    if (int(cyyyy) < 2021):
+        print('Try the unix compressed version')
+        try:
+            cddis_download_2022B(cddisfile_compressed,mdir)
+        except:
+            okokok = 1
+
         if os.path.isfile(cddisfile_compressed):
-            subprocess.call(['uncompress',cddisfile_compressed])
-    except:
-        okokok = 1
-    #except Exception as err:
-    #    print(err)
-    if not os.path.isfile(cddisfile):
-        print('going for the gzip version of the file')
-        cddis_download(cddisfile_gzip,mdir)
+            size = os.path.getsize(cddisfile_compressed)
+            if (size == 0):
+                subprocess.call(['rm',cddisfile_compressed])
+            else:
+                subprocess.call(['uncompress',cddisfile_compressed])
+            foundit = True
+
+    print('Try the gzipped version')
+    if (not foundit):
+        try:
+            cddis_download_2022B(cddisfile_gzip,mdir)
+        except:
+            okokok = 1
         if os.path.isfile(cddisfile_gzip):
-            subprocess.call(['gunzip',cddisfile_gzip])
+            size = os.path.getsize(cddisfile_gzip)
+            if (size == 0):
+                subprocess.call(['rm',cddisfile_gzip])
+            else:
+                subprocess.call(['gunzip',cddisfile_gzip])
+                foundit = True
     
     if os.path.isfile(cddisfile):
-        print('found it and change the name ')
+        print('Change the filename to what we use ', navfile)
         subprocess.call(['mv',cddisfile,navfile])
 
     return navfile
 
-def cddis_download(filename, directory):
-    """
-    https://cddis.nasa.gov/Data_and_Derived_Products/CDDIS_Archive_Access.html
-    attempt to use more secure download protocol that is CDDIS compliant
-
-    input: filename and directory (without leading location)
-
-    this will replace using wget.download when CDDIS turns off anonymous ftp
-
-    was supposed to returns whether file was created but now it just returns true
-#   --no-check-certificate
-
-    """
-    # make sure there is a logs directory
-    if not os.path.isdir('logs'):
-        subprocess.call(['mkdir', 'logs'])
-    station = filename[0:4]
-    fn = 'logs/' + station + '_cddis.txt'
-    #cddislog = open(fn, 'w+') 
-    filename = 'ftps://gdc.cddis.eosdis.nasa.gov' + directory + filename 
-    callit = ['wget', '--ftp-user','anonymous','--ftp-password', 'kristine@colorado.edu', '--no-check-certificate', filename]
-    subprocess.call(callit)
-    # try this new way - I am trying to send the messages to the file
-    #out = subprocess.run(callit, capture_output=True,text=True)
-    #cddislog.write(out.stderr)
-    #cddislog.close()
-    return True 
-
-def pickup_pbay(year,month, day):
-    """
-    jeff freymueller's site. L2C, but GPS only.
-    changed to year,month,day to be consistent with other
-    """
-    #print('downloading highrate PBAY')
-    station = 'pbay'
-    if (day == 0):
-        doy = month
-        year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
-        cyy = cyyyy[2:4]
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-
-    url = 'ftp://gps.alaska.edu/pub/gpsdata/permanent/C2/' + cyyyy + '/' + cdoy + '/'
-    fname = station + cdoy + '0.' + cyyyy[2:4] + 'o.gz'
-    url = url + fname
-    try:
-        wget.download(url,fname)
-        subprocess.call(['gunzip', fname])
-    except:
-        print('problems downloading pbay')
-
-    return True
-
 def ydoy2useful(year, doy):
     """
-    inputs: year and day of year (doy), integers
-    returns: useful stuff, like month and day and character 
-    strings for year and doy and YMD as character string ....
+    Calculates various dates
+
+    Parameters
+    ----------
+    year : int
+        full year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    year : int
+        full year
+    month : int
+        calendar month
+    day : integer
+        calendar day
+    cyyyy : str
+        four character year
+    cdoy : str
+        three character day of year
+    YMD : str
+         date as in '19-12-01' for December 1, 2019
+
     """
 
     d = datetime.datetime(year, 1, 1) + datetime.timedelta(days=(doy-1))
-#    print('ymd',d)
 #   not sure you need to do this int step
     month = int(d.month)
     day = int(d.day)
-    cdoy = '{:03d}'.format(doy)
-    cyyyy = '{:04d}'.format(year)
-    cyy = '{:02d}'.format(year-2000)
+    cyyyy, cyy, cdoy = ydoych(year,doy)
+
     cdd = '{:02d}'.format(day)
     cmonth = char_month_converter(month)
     YMD = cyy + cmonth + cdd
@@ -4999,7 +4276,21 @@ def ydoy2useful(year, doy):
 
 def prevdoy(year,doy):
     """
-    given year and doy, return previous year and doy
+    Given year and doy, return previous year and doy
+
+    Parameters
+    ----------
+    year : int
+        full year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    pyear : int
+        previous year
+    pdoy : int
+        previous day of year 
     """
     if (doy == 1):
         pyear = year -1
@@ -5014,7 +4305,22 @@ def prevdoy(year,doy):
 
 def nextdoy(year,doy):
     """
-    given year and doy, return next year and doy
+    given a year/doy returns the subsequent year/doy
+
+    Parameters
+    ----------
+    year : int
+        day of year
+    doy : int
+        day of year
+
+    Returns
+    -------
+    nyear : int
+        next year
+    ndoy : int
+        next day of year
+
     """
     dec31,cdoy,ctmp,ctmp2 = ymd2doy(year,12,31)
     if (doy == dec31):
@@ -5029,6 +4335,9 @@ def nextdoy(year,doy):
 def read_sp3file(file_path):
     """ 
     input: file_path is the sp3file name
+    this code is from Joakim Strandberg I believe.
+    It is for the python only version of the translator, which 
+    should be deprecated
 
     Returns
     -------
@@ -5037,8 +4346,6 @@ def read_sp3file(file_path):
     x,y,z are in meters
     satnum has 0, 100, 200, 300 added for gps, glonass, galileo,beidou,
     respectively.  all other satellites are ignored
-    author: kristine larson
-    some of this code came from joakim
 
     """
     ignorePoint = False
@@ -5083,12 +4390,18 @@ def read_sp3file(file_path):
 
 def nicerTime(UTCtime):
     """
-    input float hour
-    output HH:MM string
-    2021 may 3, changed to deal with hour boundaries
-    since thsi only does hours and minutes, it rounds up or down
-    depending on seconds < or > 30
-    fails near midnite ... 
+    Converts fractional time (hours) to HH:MM
+
+    Parameters
+    ----------
+    UTCtime : float
+        fractional hours of the day 
+
+    Returns 
+    -------
+    T : str
+        output as HH:MM 
+
     """
     hour = int(np.floor(UTCtime))
     minute = int ( np.floor(60* ( UTCtime - hour )))
@@ -5109,13 +4422,30 @@ def nicerTime(UTCtime):
     return T
 
 
-def big_Disk_work_hard(station,year,month,day):
+def big_Disk_work_hard(station,year,month,day,delete_hourly):
     """
-    since the NGS deletes files and leaves you with crap 30 sec files
-    you need to download the hourly and make your own, apparently?
-    if day is set to zero, we assume the month is day of year
+    Attempts to pick up subdaily RINEX 2.11 files from the NGS archive
+    creates a single RINEX file
 
+    If day is 0, then month is presumed to be the day of year
+
+    Requires gfzrnx for merging.
+
+    Parameters
+    ----------
+    station: str
+        4 char station name
+    year: int
+        year
+    month: int
+        month
+    day: integer
+        day
+
+    delete_hourly : bool
+        whether hourly files are deleted
     """
+    foundit = False
     if (day == 0):
         doy = month
         year, month, day, cyyyy,cdoy, YMD = ydoy2useful(year,doy)
@@ -5125,11 +4455,9 @@ def big_Disk_work_hard(station,year,month,day):
 
     # want to merge the hourly files into this filename
     rinexfile =  station + cdoy + '0.' + cyy + 'o'
-    exc = teqc_version()
 
     let = 'abcdefghijklmnopqrstuvwxyz';
-    alist = [exc]
-    blist = ['rm']
+    alist = []
     for i in range(0,24):
         idtag = let[i:i+1]
         fname= station + cdoy + idtag + '.' + cyy + 'o'
@@ -5138,29 +4466,48 @@ def big_Disk_work_hard(station,year,month,day):
             big_Disk_in_DC_hourly(station, year, month, day,idtag) 
         else:
             print(fname, ' exists')
-        if os.path.isfile(fname):
             alist.append(fname)
-            blist.append(fname)
 
-    print(alist)
-    fout = open(rinexfile,'w')
-    subprocess.call(alist,stdout=fout)
-    fout.close()
-    print('file created: ', rinexfile)
-    # should delete the hourly files
-    subprocess.call(blist)
+    gexe = gfz_version()
+    searchpath = station + cdoy + '*.' + cyy + 'o'
+    
+    # attempt to merge - check for pre-existing file
+    if os.path.isfile(rinexfile):
+        subprocess.call(['rm','-f', rinexfile])
 
+    # now merge the hourly files you have 
+    subprocess.call([gexe,'-finp', searchpath, '-fout', rinexfile, '-vo','2','-obs_types', 'S','-f','-q'])
+    if os.path.isfile(rinexfile):
+        print('file created: ', rinexfile)
+        foundit = True
+
+    if delete_hourly:
+        for i in range(0, len(alist)):
+            cm = ['rm', '-f',alist[i]]
+            subprocess.call(cm)
+
+    return rinexfile, foundit
 
 def big_Disk_in_DC_hourly(station, year, month, day,idtag):
     """
-    author: kristine larson
-    picks up a RINEX file from CORS. and gunzips it
-    # updated for new access protocol, 2021 aug 28
-    idtag is a small case letter from a to x (i think)
+    Picks up a one hour RINEX file from CORS. and gunzips it
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    month : int
+        calendar month
+    day : integer
+        day of the month. if zero, it means month is really day of year
+    idtag : str
+        small case letter from a to x; tells the code which hour it is
+
     """
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
-    #rinexfile,rinexfiled = rinex_name(station, year, month, day)
-    # compressed rinexfile
+    # define names
     crinexfile = station + cdoy + idtag + '.' + cyy + 'o.gz'
     rinexfile =  station + cdoy + idtag + '.' + cyy + 'o'
     # do not know if this works - but what the hey
@@ -5172,91 +4519,13 @@ def big_Disk_in_DC_hourly(station, year, month, day,idtag):
         wget.download(url, out=crinexfile)
         status = subprocess.call(['gunzip', crinexfile])
     except:
-        print('some problem in download - maybe the site does not exist on this archive')
+        print('some problem in download - maybe the file does not exist on this archive')
 
-
-def cddis3(station9ch, year, doy,srate):
-    """
-    author: kristine larson
-    just gets RINEX - does not translate it to anything else
-    """
-    fexists = False
-    ftp = 'ftp://cddis.nasa.gov/gnss/data/daily/'
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    cyyyy = str(year)
-
-    f = cyyyy + '/' + cdoy + '/' + cyy + 'd'  + '/'
-    new_way_f = '/gnss/data/daily/' + f
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + str(srate) + 'S_MO'
-    smallff = station9ch[0:4].lower() + cdoy + '0.' + cyy + 'o'
-    ending = '.crx' # compressed rinex3 ending
-    rending = '.rnx' # rinex3 ending
-    gzfilename = ff+ending + '.gz' # the crx.gz file
-    filename = ff+ending  # the crx file
-    rfilename = ff+rending # the rnx file
-    url = ftp + f + gzfilename
-    print(url)
-    crnxpath = hatanaka_version()
-    try:
-        cddis_download(gzfilename,new_way_f)
-        subprocess.call(['gunzip',gzfilename])
-        subprocess.call([crnxpath,filename])
-        subprocess.call(['rm',filename])
-    except:
-        print('no rinex3 file at CDDIS')
-
-    if os.path.isfile(rfilename):
-        fexists = True
-
-    return fexists 
-
-def unavco3(station9ch, year, doy,srate):
-    """
-    just gets rinex 3 file from unavco
-    inputs 9 character station id, year, day of year, sample rate
-    author: kristine larson
-    21sep03: change from ftp to https
-    """
-    fexists = False
-    cdoy = '{:03d}'.format(doy)
-    cyy = '{:02d}'.format(year-2000)
-    csrate = '{:02d}'.format(srate)
-    cyyyy = str(year)
-    ftp = 'ftp://data-out.unavco.org/pub/rinex3/obs/'
-    ftp = 'https://data.unavco.org/archive/gnss/rinex3/obs/'
-
-
-    f = cyyyy + '/' + cdoy + '/'
-    ff = station9ch.upper() +   '_R_' + cyyyy + cdoy + '0000_01D_' + csrate + 'S_MO'
-    smallff = station9ch[0:4].lower() + cdoy + '0.' + cyy + 'o'
-    ending = '.crx' # compressed rinex3 ending
-    rending = '.rnx' # rinex3 ending
-    gzfilename = ff+ending + '.gz' # the crx.gz file
-    filename = ff+ending  # the crx file
-    rfilename = ff+rending # the rnx file
-    url = ftp + f + gzfilename
-    print(url)
-    crnxpath = hatanaka_version()
-    try:
-        wget.download(url,gzfilename)
-        subprocess.call(['gunzip',gzfilename])
-        subprocess.call([crnxpath,filename])
-        subprocess.call(['rm',filename])
-    except:
-        print('no rinex3 file at unavco')
-
-    if os.path.isfile(rfilename):
-        fexists = True
-
-    return fexists
 
 def check_environ_variables():
     """
-    This is my attempt to make the code useable by people
-    that have not set EXE, REFL_CODE, or ORBITS environment
-    variables.  If that is the case, these variables will be 
-    set to . 
+    Checks to see if you have set the expected environment variables
+    used in gnssrefl
     """
     variables= ['EXE','ORBITS','REFL_CODE']
     for env_var in variables:
@@ -5267,7 +4536,17 @@ def check_environ_variables():
 
 def ftitle(freq):
     """
-    frequency title for plots 
+    makes a frequency title for plots 
+
+    Parameters
+    ----------
+    freq : int
+        GNSS frequency
+
+    Returns
+    -------
+    returnf : str
+        nice string for the constellation/frequency for the title of a plot
     """
     f=str(freq)
     out = {}
@@ -5282,10 +4561,13 @@ def ftitle(freq):
     out['206'] = 'Galileo L6'
     out['207'] = 'Galileo L7'
     out['208'] = 'Galileo L8'
+    # still need to work on these because it is confusing!...
+    out['301'] = 'Beidou L1'
     out['302'] = 'Beidou L2'
     out['305'] = 'Beidou L5'
     out['306'] = 'Beidou L6'
-    if freq not in [1,2, 20,5,101,102,201,205,206,207,208,302,305,306]:
+    out['307'] = 'Beidou L7'
+    if freq not in [1,2, 20,5,101,102,201,205,206,207,208,301,302,305,306,307]:
         returnf = ''
     else:
         returnf = out[f]
@@ -5296,6 +4578,16 @@ def cdate2nums(col1):
     """
     returns fractional year from ch date, e.g. 2012-02-15
     if time is blank, return 3000
+
+    Parameters
+    ----------
+    col1 : str
+        date in yyyyy-mm-dd, 2012-02-15
+
+    Returns
+    -------
+    t : float
+        fractional date, year + doy/365.25
     """
     year = int(col1[0:4])
     if year == 0:
@@ -5309,28 +4601,71 @@ def cdate2nums(col1):
 
     return t
 
+def cdate2ydoy(col1):
+    """
+    returns year and day of year from character date, e.g. '2012-02-15'
+
+    Parameters
+    ----------
+    col1 : str
+        date in yyyyy-mm-dd, 2012-02-15
+
+    Returns
+    -------
+    year : int 
+        full year
+    doy : int 
+        day of year
+    """
+    year = int(col1[0:4])
+    if year == 0:
+        t = 3000 # made up very big time!
+    else:
+        month = int(col1[5:7])
+        day = int(col1[8:10])
+        #print(col1, year, month, day)
+        doy,cdoy,cyyyy,cyy = ymd2doy(year, month, day )
+        #t = year + doy/365.25
+
+    return year, doy
+
+
 def l2c_l5_list(year,doy):
     """
-    for given year and day of year, returns a satellite list of 
-    L2C and L5 transmitting satellites
+    Creates a satellite list of L2C and L5 transmitting satellites
+    for a given year/doy
 
-    to update this numpy array, the data are stored in a simple triple of PRN number, launch year,
-    and launch date.  
-    author: kristine larson
-    date: march 27, 2021
-    june 24, 2021: updated for SVN78
+    Parameters
+    ----------
+    year: int
+        full year
+    doy: integer
+        day of year
+
+    Returns
+    -------
+    l2csatlist : numpy array (int)
+        satellites possibly transmittingL2C 
+
+    l5satlist : numpy array (int)
+        satellites possibly transmitting L5 
+
     """
 
-    # this numpy array
+    # this numpy array has the satellite number, year, and doy of each launch of a L2C satellite
+    # updated 2023 feb 1 to include prn 28 - was set operational on jan 31
     l2c=np.array([[1 ,2011 ,290], [3 ,2014 ,347], [4 ,2018 ,357], [5 ,2008 ,240],
         [6 ,2014 ,163], [7 ,2008 ,85], [8 ,2015 ,224], [9 ,2014 ,258], [10 ,2015 ,343],
         [11, 2021, 168],
         [12 ,2006 ,300], [14 ,2020 ,310], [15 ,2007 ,285], [17 ,2005 ,270],
         [18 ,2019 ,234], [23 ,2020 ,182], [24 ,2012 ,319], [25 ,2010 ,240],
-        [26 ,2015 ,111], [27 ,2013 ,173], [29 ,2007 ,355], [30 ,2014 ,151], [31 ,2006 ,270], [32 ,2016 ,36]])
+        [26 ,2015 ,111], [27 ,2013 ,173], [28,2023,17], [29 ,2007 ,355], 
+        [30 ,2014 ,151], [31 ,2006 ,270], [32 ,2016 ,36]])
     # indices that meet your criteria
     ij=(l2c[:,1] + l2c[:,2]/365.25) < (year + doy/365.25)
     l2csatlist = l2c[ij,0]
+
+    # The L5 list is defined by all L2C satellites after 2010, doy 148
     firstL5 = 2010 + 148/365.25 # launch may 28, 2010  - some delay before becoming healthy
 
     newlist = l2c[ij,:]
@@ -5352,11 +4687,37 @@ def binary(string):
 
 def ymd_hhmmss(year,doy,utc,dtime):
     """
-    inputs: year, day of year, UTC (fractional hours)
-    dtime is a logical for whether you want a datetime object
-    since i save things in year, doy and UTC hours ...
-    this gives back datetime obj and the input for that
-    (year month day hour minute second, in integers i believe)
+    translates year, day of year and UTC hours 
+    into various other time parameters
+
+    Parameters
+    ----------
+    year : int
+        full year
+    doy : int
+        full year
+    UTC : float
+        fractional hours
+    dtime : bool
+        whether you want datetime object
+
+    Returns 
+    -------
+    bigT : datetime object
+
+    year : int
+        full year
+    month : int
+        calendar month
+    day : int
+        calendar day
+    hour : int
+        hour of the day
+    minute: int
+        minutes of the day
+    second : int
+        seconds
+
     """
     year = int(year) # just in case
     d = datetime.datetime(year, 1, 1) + datetime.timedelta(days=(doy-1))
@@ -5364,7 +4725,9 @@ def ymd_hhmmss(year,doy,utc,dtime):
     day = int(d.day)
     hour = int(np.floor(utc))
     minute = int ( np.floor(60* ( utc- hour )))
-    second = int(utc*3600 - (hour*3600 + minute*60))
+    #second = int(utc*3600 - (hour*3600 + minute*60))
+    second = round(utc*3600 - (hour*3600 + minute*60))
+    #print(second, utc*3600 - (hour*3600 + minute*60))
     if second == 60:
         second = 0
         minute = minute + 1
@@ -5378,20 +4741,21 @@ def ymd_hhmmss(year,doy,utc,dtime):
     return bigT, year, month, day, hour, minute, second
 
 
-# don't need to print out success
-#print('found the ', env_var, ' environment variable')
-
-        #wget.download(url, out=comp_rinexfiled)
-        #status = subprocess.call(['uncompress', comp_rinexfiled])
-        #status = subprocess.call([crnxpath, rinexfiled])
-        # rm the hatanaka file
-        #status = subprocess.call(['rm','-f',rinexfiled])
-
-
 def get_obstimes(tvd):
     """
-    send a LSP results, so the variable created when you read 
-    in the results file.  return obstimes for plotting 
+    Calculates datetime objects for times associated with 
+    LSP results file contents, i.e. the variable created when you read 
+    in the results file.  
+
+    Parameters
+    ----------
+    tvd : numpy array
+        results of LSP results
+
+    Returns
+    ------
+    obstimes : numpy array
+        datetime objects
     """
     nr,nc = tvd.shape
     obstimes = []
@@ -5405,201 +4769,651 @@ def get_obstimes(tvd):
 
     return obstimes
 
+def get_obstimes_plus(tvd):
+    """
+    send a LSP results file, so the variable created when you read
+    in the results file.  return obstimes for matplotlib plotting purposes
+    2022jun10 - added MJD output
+
+    See get_obstimes 
+    2024apr06 too slow because I was using np.append
+
+    Parameters
+    ----------
+    tvd : numpy array
+        contents of Lomb Scargle data processing
+    Returns
+    -------
+    obstimes: list of datetime objects
+        times of observations 
+    modjulian : list of floats
+        modified julian days
+
+    """
+    nr,nc = tvd.shape
+    obstimes = []
+    #modjulian = np.empty(shape=[0,1])
+    modjulian = []
+
+    if nr > 0:
+        for ijk in range(0,nr):
+            dtime, iyear,imon,iday,ihour,imin,isec = ymd_hhmmss(tvd[ijk,0],tvd[ijk,1],tvd[ijk,4],True)
+            obstimes.append(dtime)
+            m,f = mjd(iyear,imon,iday,ihour,imin,isec)
+            x=[m+f]
+            xx = m+f
+            #modjulian = np.append(modjulian, [x],axis=0 )
+            modjulian.append(xx)
+    else:
+        print('empty file')
+
+    # afterwards change to np array - but probably best to keep them as lists for now
+    #modjulian = np.asarray(modjulian)
+
+    return obstimes, modjulian
+
+
+def confused_obstimes(tvd):
+    """
+    this will be slow (and should be fixed)
+
+    Parameters
+    ----------
+    tvd : numpy array
+        results of LSP results
+
+    Returns
+    -------
+    modifiedjulian : numpy array of floats
+        modified julian date values
+    """
+    nr,nc = tvd.shape
+    modifiedjulian = []
+    if nr > 0:
+        for ijk in range(0,nr):
+            dtime, iyear,imon,iday,ihour,imin,isec = ymd_hhmmss(tvd[ijk,0],tvd[ijk,1],tvd[ijk,4],True)
+            m,f = mjd(iyear,imon,iday,ihour,imin,isec)
+            modifiedjulian = np.append(modifiedjulian, m+f)
+    else:
+        print('empty file')
+
+    return modifiedjulian
+
+def more_confused_obstimes(tvd):
+    """
+    too slow
+
+    Parameters
+    ----------
+    tvd : numpy array of floats
+        lsp results from a loadtxt command
+
+    Returns
+    -------
+    modifiedjulian : numpy array of floats 
+         mjd values
+        
+    """
+    nr,nc = tvd.shape
+    modifiedjulian = []
+    if nr > 0:
+        for ijk in range(0,nr):
+            #MM DD HH Min Sec
+            (18,19,20,21,22)
+            #dtime, iyear,imon,iday,ihour,imin,isec = ymd_hhmmss(tvd[ijk,0],tvd[ijk,1],tvd[ijk,4],True)
+            iyear = tvd[ijk,0]; imon = tvd[ijk,17]; iday = tvd[ijk,18]
+            ihour = tvd[ijk,19]; imin = tvd[ijk,20]
+            isec =  tvd[ijk,21]
+            m,f = mjd(iyear,imon,iday,ihour,imin,isec)
+            modifiedjulian = np.append(modifiedjulian, m+f)
+    else:
+        print('empty file')
+
+    return modifiedjulian
+
+
+
+def read_simon_williams(filename,outfilename):
+    """
+    Reads a PSMSL file and creates a new file in the 
+    standard format I use for tide gauge data in gnssrefl
+    
+    Parameters
+    ----------
+    filename : str
+        datafile of GNSS based water level measurements from 
+        the archive at PSMSL created by Simon Williams 
+
+    outfilename : str
+        where the rewritten data will go
+
+    Returns
+    -------
+    outobstimes : datetime array
+        time of observations
+
+    outmjd : numpy array of floats
+        modified julian day
+
+    outsealevel : numpy array of floats 
+        sea level, meters
+
+    prn : numpy array of integers
+        satellite numbers
+
+    fr : numpy array of integers
+        frequency
+
+    az : numpy array of floats
+        azimuth (degrees)
+
+    """
+
+    fout = open(outfilename,'w+')
+    print('Writing PSMSL GNSS-IR data to ', outfilename)
+    csv = False
+    if outfilename[-3:] == 'csv':
+        csv = True
+
+    if csv:
+        fout.write("# YYYY,MM,DD,HH,MM, Water(m),DOY, MJD, Seconds,Freq, Azim,PRN \n")
+    else:
+        fout.write("%YYYY  MM  DD  HH  MM  Water(m) DOY    MJD    Sec   Freq  Azim    PRN  raw  fit-tide mod-raw \n")
+        fout.write("% (1) (2) (3) (4)  (5)   (6)    (7)     (8)   (9)   (10)   (11)  (12)  (13)  (14)     (15)\n")
+
+    # read the file three times because i am loadtxt impaired
+    # string
+    tv = np.loadtxt(filename,usecols=(0,1,2,3),skiprows=10,dtype='str',delimiter=',')
+    # integers
+    ivals = np.loadtxt(filename,usecols=(4,5),skiprows=10, dtype='int',delimiter=',')
+    # floats
+    fvals = np.loadtxt(filename,usecols=(6),skiprows=10, dtype='float',delimiter=',')
+    # store the latter columns directly
+    prn = ivals[:,0]
+    fr = ivals[:,1]
+    az = fvals
+
+    nr = len(tv)
+    # these are converted to numpy at the bottom
+    obstimes = []
+    modjulian = []
+    sealevel = []
+    s1=time.time()
+
+    for i in range(0,nr):
+        year = int(tv[i,0][0:4])
+        mm = int(tv[i,0][5:7])
+        dd = int(tv[i,0][8:10])
+        doy,cdoy,cyyyy,cyy = ymd2doy(year,mm,dd)
+        hh = int(tv[i,0][11:13])
+        minutes = int(tv[i,0][14:16])
+        sec = int(tv[i,0][17:19])
+        raw = float(tv[i,1])
+        modraw = float(tv[i,2])
+        tidefit = float(tv[i,3])
+        dtime = datetime.datetime(year=year, month=mm, day=dd, hour=hh, minute=minutes, second=sec)
+        imjd, frac = mjd(year,mm,dd,hh,minutes,sec)
+        x = [imjd+frac]
+        # go ahead and write to a file ... 
+        if csv:
+            fout.write(" {0:4.0f},{1:2.0f},{2:2.0f},{3:2.0f},{4:2.0f},{5:7.3f},{6:3.0f},{7:15.6f},{8:2.0f},{9:1.0f},{10:8.3f},{11:2.0f},{12:6.3f},{13:6.3f} \n".format(year, mm, dd, hh, minutes, modraw, doy, imjd+frac, sec, fr[i], az[i],prn[i],raw,tidefit))
+        else:
+            fout.write(" {0:4.0f} {1:3.0f} {2:3.0f} {3:3.0f} {4:3.0f} {5:7.3f} {6:3.0f} {7:15.6f} {8:2.0f} {9:1.0f} {10:8.3f} {11:2.0f} {12:6.3f} {13:6.3f}  \n".format(year, mm, dd, hh, minutes, modraw, doy, imjd+frac, sec, fr[i], az[i], prn[i], raw,tidefit))
+
+        obstimes.append(dtime)
+        modjulian.append(x)
+        sealevel.append(modraw)
+
+    fout.close()
+
+    s2=time.time()
+    print('that took ', round(s2-s1,2), ' seconds')
+
+    outobstimes= np.asarray(obstimes)
+    outsealevel = np.asarray(sealevel)
+    outmjd = np.asarray(modjulian)
+
+    return outobstimes, outmjd, outsealevel, prn, fr, az
 
 
 def get_noaa_obstimes(t):
     """
-    send a noaa file variable. returns obstimes.
-    i guess one could learn how to use pandas ... nah
+    Needs to be be fixed for new file structure
+
+    Parameters
+    ----------
+    t : list of integers
+        year, month, day, hour, minute, second 
+
+    Returns
+    -------
+    obstimes : list
+        datetime format
+
     """
     nr,nc = t.shape
     obstimes = []
 
     # if i read in the file better, would not have to change from float
+    # year mon day hour min sealevel doy mjd seconds
     if nr > 0:
         for i in range(0,nr):
-            dtime = datetime.datetime(year=int(t[i,0]), month=int(t[i,1]), day=int(t[i,2]), hour=int(t[i,3]), minute=int(t[i,4]), second=0)
+            dtime = datetime.datetime(year=int(t[i,0]), month=int(t[i,1]), day=int(t[i,2]), hour=int(t[i,3]), minute=int(t[i,4]), second=int(t[i,5]) )
             obstimes.append(dtime)
     else:
         print('you sent me an empty variable')
 
     return obstimes
 
-def queryUNR(station):
+def get_noaa_obstimes_plus(t,**kwargs):
     """
-    use UNR database to get a priori lat/long in degrees
-    and ellipsoidal height (meters)
-    """
-    xdir = os.environ['REFL_CODE']
-    print('Check for the UNR station coordinate database')
+    given a list of time tags (y,m,d,h,m,s), it calculates datetime
+    objects and modified julian days
 
-    lower = station
-    if len(lower) != 4:
-        print('No coordinates in the UNR database for ', lower)
-        print('The station name must be four characters long')
-        return
-    # if you used github and run the code from that directory
-    nfile = 'gnssrefl/Data.names'
-    pfile = 'gnssrefl/Data.pos'
-    if os.path.isfile(nfile) and os.path.isfile(pfile):
-       print('found the station database files in the gnssrefl directory')
+    Parameters
+    ----------
+    t : numpy array
+        our water level format
+        where year, month, day, hour, minute, second are in the first columns
+
+    Returns
+    -------
+    obstimes : list of datetime obj
+        list of timetags 
+
+    modjulian : list of floats
+        modified julian date 
+
+    """
+    time_format = kwargs.get('time_format','new')
+    if time_format == 'new':
+        tt = True
     else:
-        nfile = xdir + '/Files/Data.names'
-        pfile = xdir + '/Files/Data.pos'
-        if os.path.isfile(nfile) and os.path.isfile(pfile):
-            print('found the station database files in the REFL_CODE Files directory')
-        else:
-            print('try to download the station database files from github for you')
-            try:
-                url1= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/Data.names' 
-                url2= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/Data.pos' 
-                wget.download(url1,nfile)
-                wget.download(url2,pfile)
-            except:
-                print('failed to get the station database files')
-                return
-    if os.path.isfile(nfile) and os.path.isfile(pfile):
-        labels = np.genfromtxt(nfile, delimiter=' ', dtype=str)
-        raw_data = np.genfromtxt(pfile, delimiter=' ' )
-        data = {label: row for label, row in zip(labels, raw_data)}
-    # should put this in a try
-        station = station.upper()
-        llat = 0; llon = 0; height = 0;
-        try:
-            llh = data[station]
-            llat =llh[0]; llon =llh[1]; height =llh[2]
-        except:
-            print('nada-no coordinates in the database')
+        tt = False
 
-        if (llat != 0):
-            print('\n', lower, llat, llon, height)
-            x,y,z=llh2xyz(llat,llon,height)
-            print("%15.4f %15.4f %15.4f "% (x,y,z) )
-        else:
-            print('No coordinates in the UNR database for ', lower)
+    nr,nc = t.shape
+
+    obstimes = []
+    # was doing this
+    #modjulian = np.empty(shape=[0,1])
+    # now try this
+    modjulian=[]
+
+    # if i read in the file better, would not have to change from float
+    # slow because i am using np.append
+    if nr > 0:
+        for i in range(0,nr):
+            # new fileformat
+            if tt:
+                year = int(t[i,0]); month=int(t[i,1]); day=int(t[i,2]); hour=int(t[i,3]); minute=int(t[i,4]); second = int(t[i,5])
+            else:
+                year = int(t[i,0]); month=int(t[i,1]); day=int(t[i,2]); hour=int(t[i,3]); minute=int(t[i,4]); second = int(t[i,8])
+
+            dtime = datetime.datetime(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
+            obstimes.append(dtime)
+            imjd, fr = mjd(year,month,day,hour,minute,second)
+            x = [imjd+fr]
+            #modjulian = np.append(modjulian, x)
+            xx = float(imjd+fr)
+            modjulian.append(xx)
     else:
-        print('Cannot find the requesite UNR files, which usually live in the gnssrefl directory below')
-        print('where you installed the gnssrefl code or in $REFL_CODE/Files.')
-        return 0,0,0
+        print('you sent me an empty variable')
 
-    # lat and lon are in degrees
-    return llat,llon,height
+    # change modjulian to numpy array at the append
+    #modjulian = np.asarray(modjulian)
+    #nr,nc=modjulian.shape
+    #print('mjd', nr,nc)
+    #nr,nc=obstimes.shape
+    #print('obstimes ' , nr,nc)
 
-def rapid_gfz_orbits(year,month,day):
+    return obstimes, modjulian
+
+
+def final_gfz_orbits(year,month,day):
     """
-    input year, month, day OR
-    year, doy, 0
-    downloads rapid GFZ sp3 file and stores in $ORBITS
-    november 5, 2021 fixed their ftp address
+    downloads gfz final orbit and stores in $ORBITS
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year if day is set to zero
+    day : int
+        day of month
+
+    Returns
+    -------
+    littlename : str
+        orbit filename, fdir, foundit
+    fdir: str
+        directory where the orbit file is stored locally
+    foundit : bool
+        whether the file was found
     """
     foundit = False
     dday = 2021 + 137/365.25
     wk,sec=kgpsweek(year,month,day,0,0,0)
 
-    gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/rapid/'
+    gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/final/'
     if day == 0:
        doy=month
        d = doy2ymd(year,doy);
        month = d.month; day = d.day
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
     fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
-    littlename = 'gfz' + str(wk) + str(int(sec/86400)) + '.sp3'
+    littlename = 'gbm' + str(wk) + str(int(sec/86400)) + '.sp3'
+    #GFZ0MGXRAP_20222740000_01D_05M_ORB.SP3
+    #GFZ0OPSFIN
+    # GFZ0MGXRAP_20222440000_01D_05M_ORB.SP3
+    littlename = 'GFZ0MGXRAP_' + str(year) + cdoy + '0000_01D_05M_ORB.SP3'
+
     url = gns + 'w' + str(wk) + '/' + littlename + '.gz'
-    print(url)
-    if (year + doy/365.25) < dday:
-        print('No rapid GFZ orbits until 2021/doy137')
-        return '', '', foundit
+    #print(url)
+
     fullname = fdir + '/' + littlename + '.xz'
-    # look for compressed file
     if os.path.isfile(fullname):
         subprocess.call(['unxz', fullname])
 
+    fullname = fdir + '/' + littlename + '.gz'
+    if os.path.isfile(fullname):
+        subprocess.call(['gunzip', fullname])
+
     if os.path.isfile(fdir + '/' + littlename):
-        print(littlename, ' already exists on disk')
+        #print(littlename, ' already exists on disk')
         return littlename, fdir, True 
+
     try:
         wget.download(url,littlename + '.gz')
         subprocess.call(['gunzip', littlename + '.gz'])
     except:
-        print('Problems downloading Rapid GFZ orbit')
+        print('Problems downloading final multi-GNSS GFZ orbit from GFZ')
+        print(url)
 
     if os.path.isfile(littlename):
        store_orbitfile(littlename,year,'sp3') ; foundit = True
 
     return littlename, fdir, foundit
 
-
-def ultra_gfz_orbits(year,month,day,hour):
+def rapid_gfz_orbits(year,month,day):
     """
-    input year, month, day OR
-    year, doy, 0
-    hour is needed to figur out which ultra file to pick up 
-    downloads rapid GFZ sp3 file and stores in $ORBITS
+    downloads gfz rapid orbit and stores in $ORBITS locally
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year if day is set to zero
+    day : int
+        day of month
+
+    Returns
+    -------
+    littlename : str
+        name of the orbit file
+    fdir: str
+        name of the file directory where orbit is stored
+    foundit : bool
+        whether file was found
+
     """
     foundit = False
     dday = 2021 + 137/365.25
+    dday2 = 2024 + 149/365.25
     wk,sec=kgpsweek(year,month,day,0,0,0)
+
+    gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/rapid/'
+
+    new_gns = 'ftp://isdcftp.gfz-potsdam.de/gnss/products/rapid/'
+
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
+    fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
+    littlename = 'gfz' + str(wk) + str(int(sec/86400)) + '.sp3'
+    longname = 'GFZ0OPSRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3'
+    url = gns + 'w' + str(wk) + '/' + littlename + '.gz'
+    url2 = new_gns + 'w' + str(wk) + '/' + longname + '.gz'
+    if (year + doy/365.25) < dday:
+        print('No rapid GFZ orbits until 2021/doy137')
+        return '', '', foundit
+
+    if (year + doy/365.25) > dday2:
+        #print('Use the second way to download: ', url2)
+        fullname = fdir + '/' + longname 
+        if os.path.isfile(fullname):
+            foundit = True
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True
+        else:
+            try:
+                wget.download(url2, longname + '.gz')
+                if os.path.isfile(longname + '.gz'):
+                    subprocess.call(['gunzip', longname + '.gz'])
+                    store_orbitfile(longname,year,'sp3') ; 
+                foundit = True
+            except:
+                print('problems downloading Rapid GFZ orbit (2)')
+
+        return longname, fdir, foundit
+
+    else:
+        #print('Try First way to download : ',url)
+        fullname = fdir + '/' + littlename
+        if os.path.isfile(fullname):
+            foundit = True
+        elif os.path.isfile(fullname + '.xz'):
+            subprocess.call(['unxz', fullname + '.xz'])
+            foundit = True
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True
+        else:
+            try:
+                wget.download(url,littlename + '.gz')
+                if os.path.isfile(littlename + '.gz'):
+                    subprocess.call(['gunzip', littlename + '.gz'])
+                    foundit = True
+            except:
+                print('Problems downloading Rapid GFZ orbit (1)')
+
+            if os.path.isfile(littlename):
+                store_orbitfile(littlename,year,'sp3') ; foundit = True
+
+        return littlename, fdir, foundit
+
+
+def ultra_gfz_orbits(year,month,day,hour):
+    """
+    downloads rapid GFZ sp3 file and stores them in $ORBITS
+    is this correct?  or is the regular file?
+
+    started to changed file directory source and name in may 2024
+    right now they are segregated
+
+
+    I am not sure this works anymore.  You should use new_ultra instead
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year
+    day : int
+        day or if set to 0, then month is really day of year
+    hour : int
+        hour of the day
+
+    Returns
+    -------
+    littlename : str
+        name of the orbit file
+    fdir: str
+        name of the file directory where orbit is stored
+    foundit : bool
+        whether file was found
+    """
+    foundit = False
+    # when they changed over?
+    dday = 2021 + 137/365.25
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
+    # figure out the GPS week number
+    wk,sec=kgpsweek(year,month,day,0,0,0)
+
+
+    # try the day before cause ... 
+    if (doy == 1):
+        wk0,sec0=kgpsweek(year-1,12,31,0,0,0)
+    else:
+        doy = doy-1
+        yy, mm, dd, t1,tw,t2 = ydoy2useful(year,doy)
+        wk0,sec0=kgpsweek(yy,mm,dd,0,0,0)
+
+
     gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/ultra/'
-    if day == 0:
-       doy=month
-       d = doy2ymd(year,doy);
-       month = d.month; day = d.day
-    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
     fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
     # change the hour into two character string
     chr = '{:02d}'.format(hour)
     littlename = 'gfu' + str(wk) + str(int(sec/86400)) + '_' + chr + '.sp3'  
     url = gns + 'w' + str(wk) + '/' + littlename + '.gz'
-    print(url)
+
+    #print(url)
     if (year + doy/365.25) < dday:
-        print('No rapid GFZ orbits until 2021/doy137')
+        print('No rapid GFZ orbits until 2021/doy137. Not sure about ultra')
         return '', '', foundit
 
+    # check to see if the file is there already
     fullname = fdir + '/' + littlename + '.xz'
     if os.path.isfile(fullname):
         subprocess.call(['unxz', fullname])
 
-    if os.path.isfile(fdir + '/' + littlename):
-        print(littlename, ' already exists on disk')
-        return littlename, fdir, True
+    # check to see if the file is there already
+    fullname = fdir + '/' + littlename + '.gz'
+    if os.path.isfile(fullname):
+        subprocess.call(['gunzip', fullname])
 
+    if os.path.isfile(fdir + '/' + littlename):
+        #print(littlename, ' already exists on disk')
+        return littlename, fdir, True
 
     try:
         wget.download(url,littlename + '.gz')
         subprocess.call(['gunzip', littlename + '.gz'])
     except:
         print('Problems downloading ultrarapid GFZ orbit')
+        print(url)
+        littlename = 'gfu' + str(wk0) + str(int(sec0/86400)) + '_' + chr + '.sp3'  
+        url = gns + 'w' + str(wk) + '/' + littlename + '.gz'
+        print('now try the day before ', url)
+        wget.download(url,littlename + '.gz')
+        subprocess.call(['gunzip', littlename + '.gz'])
 
     if os.path.isfile(littlename):
         store_orbitfile(littlename,year,'sp3') ; foundit = True
 
     return littlename, fdir, foundit
 
+
+def get_wuhan_orbits(year: int, month: int, day: int, hour: int) -> [str, str, bool]:
+    """
+    Downloads ultra-rapid Wuhan sp3 file and stores them in $ORBITS
+
+    modified 2024 jul 8 to download files with NRT names
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year
+    day : int
+        day or if set to 0, then month is really day of year
+    hour : int
+        specific hour of ultrarapid orbit
+
+    Returns
+    -------
+    unzipped_filename : str
+        name of the sp3 orbit file
+    orbit_dir: str
+        name of the file directory where orbit is stored
+    foundit : bool
+        whether file was found
+    """
+    foundit = False
+    gps_week, _ = kgpsweek(year, month, day, 0, 0, 0)
+    _, _, doy, _, _, _ = ymd2ch(year, month, day)
+
+    # they changed the name from ULT to NRT around year 2024 doy 187
+    url_base = f'ftp://igs.gnsswhu.cn/pub/gnss/products/mgex/{gps_week}/'
+    # changed this to have hour
+    filename = f'WUM0MGXULT_{year}{doy:03}{hour:02}00_01D_05M_ORB.SP3.gz'
+    unzipped_filename = filename[:-3]
+
+    if (year + doy/365.25) >= (2024 + 187/365.25):
+        # do the day before and use NRT instead of ULT
+        if doy == 1:
+            _, _, doy, _, _, _ = ymd2ch(year-1, 12, 31)
+        else:
+            doy = doy - 1 
+        # ? also need to change the directory from the GPS week
+        # get new ymd values
+        tyear, tmonth, tday = ydoy2ymd(year,doy)
+        gps_week, _ = kgpsweek(tyear, tmonth, tday, 0, 0, 0)
+        # get new url_base
+        url_base = f'ftp://igs.gnsswhu.cn/pub/gnss/products/mgex/{gps_week}/'
+
+        filename = f'WUM0MGXNRT_{year}{doy:03}{hour:02}00_02D_05M_ORB.SP3.gz'
+        unzipped_filename = filename[:-3]
+
+    print(filename)
+    orbit_dir = f'{os.environ["ORBITS"]}/{year}/sp3'
+    if not os.path.isfile(f'{orbit_dir}/{unzipped_filename}'):
+        try:
+            wget.download(f'{url_base}{filename}', filename)
+            subprocess.call(['gunzip', filename])
+        except:
+            print('Problems downloading ultra-rapid Wuhan orbit')
+            print(f'{url_base}{filename}')
+        if os.path.isfile(unzipped_filename):
+            print('\n')
+            store_orbitfile(unzipped_filename, year, 'sp3')
+            foundit = True
+    else:
+        #print('Wuhan orbit wum2 is stored locally')
+        foundit = True
+
+    return unzipped_filename, orbit_dir, foundit
+
+
 def rinex_unavco(station, year, month, day):
     """
-    author: kristine larson
-    picks up a RINEX file from default unavco area, i.e. not highrate.  
-    it tries to pick up an o file,
-    but if it does not work, it tries the "d" version, which must be
-    decompressed.  the location of this executable is defined in the crnxpath
-    variable. 
-    year, month, and day are INTEGERS
+    This is being used by the vegetation code
+    picks up a RINEX 2.11 file from unavco low-rate area
+    requires Hatanaka code
 
-    WARNING: only rinex version 2.11 in this world
+    Parameters
+    ----------
+    station: str
+        4 ch station name
 
-    if day is zero, assumes month is really doy
+    year : integer
+        full year
 
-    21sep01  changed from ftp to https
+    month : integer
+        month or day of year
+
+    day: integer
+        day of month or zero
+
     """
     exedir = os.environ['EXE']
     crnxpath = hatanaka_version()  # where hatanaka will be
-    if day == 0:
-        doy = month
-        cyyyy = str(year)
-        cdoy = '{:03d}'.format(doy)
-        cyy = '{:02d}'.format(year-2020)
-    else:
-        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
     rinexfile,rinexfiled = rinex_name(station, year, month, day)
     unavco= 'https://data.unavco.org/archive/gnss/rinex/obs/'
     filename1 = rinexfile + '.Z'
@@ -5614,9 +5428,7 @@ def rinex_unavco(station, year, month, day):
     except:
         okokok =1
 
-    #print('try hatanaka RINEX at unavco')
     if not os.path.exists(rinexfile):
-        #print('look for hatanaka version')
         if os.path.exists(crnxpath):
             try:
                 wget.download(url2,filename2)
@@ -5634,7 +5446,27 @@ def rinex_unavco(station, year, month, day):
 def avoid_cddis(year,month,day):
     """
     work around for people that can't use CDDIS ftps
-    this will get multi-GNSS files for GFZ from IGN
+    this will get multi-GNSS files for GFZ from the IGN
+    hopefully
+
+    Parameters
+    ----------
+    year : int 
+        full year
+    month : int
+        month of the year
+    day : int
+        calendar day
+
+    Returns
+    -------
+    filename : str
+        name of the orbit file
+    fdir : str
+        where the orbit file is stored
+    foundit : bool
+        whether it was found or not
+
     """
     fdir = os.environ['ORBITS'] + '/' + str(year) + '/sp3/'
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
@@ -5645,11 +5477,13 @@ def avoid_cddis(year,month,day):
     filenameZ = 'gbm' + cwk + cday + '.sp3.Z'
     filename = 'gbm' + cwk + cday + '.sp3'
     if os.path.isfile(fdir + filename):
-        print(filename,' orbit file already exists on disk'); foundit = True
+        #print(filename,' orbit file already exists on disk'); 
+        foundit = True
         return filename, fdir, foundit
     if os.path.isfile(fdir + filename + '.xz'):
         subprocess.call(['unxz',fdir + filename + '.xz'])
-        print(filename, ' orbit file already exists on disk'); foundit = True
+        #print(filename, ' orbit file already exists on disk'); 
+        foundit = True
         return filename, fdir, foundit
 
     # only use this for weeks < 2050
@@ -5667,11 +5501,13 @@ def avoid_cddis(year,month,day):
         filenamegz = 'GFZ0MGXRAP_' + cyyyy  + cdoy + '0000_01D_05M_ORB.SP3.gz'
 
         if os.path.isfile(fdir + filename):
-            print(filename, ' orbit file already exists on disk'); foundit = True
+            #print(filename, ' orbit file already exists on disk'); 
+            foundit = True
             return filename, fdir, foundit
         if os.path.isfile(fdir + filename + '.xz'):
             subprocess.call(['unxz',fdir + filename + '.xz'])
-            print(filename, ' orbit file already exists on disk'); foundit = True
+            #print(filename, ' orbit file already exists on disk'); 
+            foundit = True
             return filename, fdir, foundit
 
         url = 'ftp://igs.ensg.ign.fr/pub/igs/products/mgex/' + cwk +  '/' + filenamegz
@@ -5686,57 +5522,28 @@ def avoid_cddis(year,month,day):
 
     return filename, fdir, foundit
 
-def get_cddis_navfile_test(navfile,cyyyy,cyy,cdoy):
-    """
-    kristine larson
-    inputs navfile name with character string verisons of year, 2ch year and doy
-    tries to download from CDDIS archive
-
-    20jun11, implemented new CDDIS security requirements
-    21jan06, gz instead of Z
-    try to get galileo nav files
-    """
-    # ths old way
-    # just in case you sent it the navfile with auto instead of brdc
-    #cddisfile = 'brdc' + navfile[4:] + '.Z'
-    #cddis = 'ftp://cddis.nasa.gov'
-    # navfile will continue to be called auto
-    #navfile_compressed = cddisfile
-
-    # new way
-    cddisfile = 'brdc' + cdoy + '0.' +cyy  +'e'
-    cddisfile_compressed = cddisfile + '.Z'
-    cddisfile_gzip = cddisfile + '.gz'
-    # where the file should be at CDDIS ....
-    mdir = '/gps/data/daily/' + cyyyy + '/' + cdoy + '/' +cyy + 'n/'
-
-    try:
-        cddis_download(cddisfile_compressed,mdir)
-        if os.path.isfile(cddisfile_compressed):
-            subprocess.call(['uncompress',cddisfile_compressed])
-    except:
-        okokok = 1
-    #except Exception as err:
-    #    print(err)
-    if not os.path.isfile(cddisfile):
-        print('going for the gzip version of the file')
-        cddis_download(cddisfile_gzip,mdir)
-        if os.path.isfile(cddisfile_gzip):
-            subprocess.call(['gunzip',cddisfile_gzip])
-
-    if os.path.isfile(cddisfile):
-        print('found it and change the name ')
-        subprocess.call(['mv',cddisfile,navfile])
-
-    return navfile
-
 def rinex_jp(station, year, month, day):
     """
-    author: Naoya Kadota
-    2021oct25
     Picks up RINEX file from Japanese GSI GeoNet archive
     URL : https://www.gsi.go.jp/ENGLISH/index.html
+
+    Parameters
+    ----------
+    station : str
+        station name
+
+    year : int
+        full year
+
+    month: int
+        month or day of year
+
+    day : int
+        day of month or zero
     """
+    # allow it to be called with day of year
+    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+
     fdir = os.environ['REFL_CODE']
     if not os.path.isdir(fdir):
         print('You need to define the REFL_CODE environment variable')
@@ -5767,10 +5574,8 @@ def rinex_jp(station, year, month, day):
         password= getpass.getpass(prompt='Password: ', stream=None)
         #password = input()
     # if doy is input, convert to month and day
-    if day == 0:
-        doy=month
-        d = doy2ymd(year,doy);
-        month = d.month; day = d.day
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
     doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
     gns = 'terras.gsi.go.jp/data/GR_2.11/'
     file1 =station[-4:].upper() + cdoy + '0.' + cyy + 'o' + '.gz'
@@ -5791,33 +5596,57 @@ def rinex_jp(station, year, month, day):
 
 def queryUNR_modern(station):
     """
-    query UNR database that has been stored in sql
+    Queries the UNR database for station coordinates that has been stored in sql. downloads 
+    the sql file and stores it locally if necessary
+
+    Also queries a local file if you have defined one.
+    It should be located in $REFL_CODE/input/llh_local.txt
+    four columns should be 4 character station name lat lon height
+    No commas between them and the station name should be four characters
+    Hopefully lowercase, but I will try to put in a toggle that allows uppercase
+
     """
     lat = 0; lon = 0; ht = 0
     if len(station) != 4:
         print('The station name must be four characters long')
         return lat, lon, ht
 
-    nfile1 = 'gnssrefl/station_pos.db'
-    nfile1_exist = os.path.isfile(nfile1)
+    not_in_database = False
     xdir = os.environ['REFL_CODE']
-    nfile2 = xdir + '/Files/station_pos.db'
-    nfile2_exist = os.path.isfile(nfile2)
+    fdir = xdir + '/Files'
+    if not os.path.isdir(fdir):
+        subprocess.call(['mkdir', fdir])
 
-    if (not nfile1_exist) and (not nfile2_exist):
-        print('Try to download the station database from github for you')
-        try:
-            url1= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/station_pos.db'
-            wget.download(url1,nfile2)
-            nfile2_exist = True
-        except:
-            print('Could not download the database for you')
-            return lat, lon, ht
-    # if you used github and run the code from that directory
-    if nfile1_exist:
-        conn = sqlite3.connect(nfile1)
-    elif nfile2_exist:
-        conn = sqlite3.connect(nfile2)
+    # check local database file
+    foundit, lat, lon, ht = query_coordinate_file(station)
+    if foundit:
+        return lat, lon, ht 
+
+    # new database locations 
+    nfile00 = 'gnssrefl/station_pos_2024.db'
+    nfile0 = xdir + '/Files/station_pos_2024.db'
+
+    # old database locations
+    nfile1 = 'gnssrefl/station_pos.db'
+    nfile2 = xdir + '/Files/station_pos.db'
+
+
+    haveit,usedatabase = unr_database(nfile0, nfile00, 'station_pos_2024.db')
+    # i will no longer support downloading the old station database. But will allow you to use
+    # it if it exists ...
+    if (not haveit):
+        exist_old_database = os.path.isfile(nfile2)
+        if exist_old_database:
+            haveit = True
+            usedatabase = nfile2
+
+    if not haveit:
+        print('No station database was found.')
+        return 0, 0, 0
+    else:
+        #print('Using database ', usedatabase)
+        conn = sqlite3.connect(usedatabase)
+
     c=conn.cursor()
     c.execute("SELECT * FROM  stations WHERE station=:station",{'station': station})
     w = c.fetchall()
@@ -5826,18 +5655,52 @@ def queryUNR_modern(station):
         # if longitude is ridiculous, as it often is in the Nevada Reno database make it less so
         if (lon < -180):
             lon = lon + 360
-        print(lat,lon,ht)
     else:
-        print('Did not find the station in the database:', station)
+        not_in_database = True
 
     # close the database
     conn.close()
-    # lat and lon are in degrees
+
+    # some of the Nevada Reno stations have the same names as stations used in GNSS-IR.
+    # here we override them
+
+    if (station == 'moss'):
+        lat= -16.434464800 ;lon = 145.403622520 ; ht = 71.418
+        print('override')
+    elif (station == 'mnis'):
+        lat = -16.667810553; lon  = 139.170597267; ht = 60.367;  
+        print('override')
+    elif (station == 'boig'):
+        lat =  -9.24365375 ; lon  = 142.253961217; ht = 82.5;  
+        print('override')
+    elif (station == 'glbx'):
+        lat = 58.455146633; lon  = -135.888483766 ; ht = 12.559;  
+        print('override')
+    elif (station == 'ugar'):
+        lat = -9.50477824; lon = 143.54686680 ; ht =  81.2
+        print('override')
+    elif (station == 'whla'):
+        lat = -33.01640186 ; lon = 137.59157111 ; ht = 7.856
+        print('override')
+    elif (station == 'kubn'):
+        lat =-10.23608303 ; lon =142.21446068; ht = 78.2
+        print('override')
+    elif (station == 'smm4'):
+        lat =72.57369139 ; lon =-38.470709199 ; ht = 3262
+        print('override')
+    elif (station == 'pchl'):
+        print('override')
+        lat = 60.242562899 ; lon = -147.248979547 ; ht = 18.368
+
+    if (not_in_database) and (lat == 0):
+        print('Did not find station coordinates :', station)
 
     return lat,lon,ht
 
 def rinex3_nav(year,month,day):
     """
+    not sure what this does!
+
     """
     foundit = False
     fdir = ''
@@ -5853,11 +5716,1799 @@ def rinex3_nav(year,month,day):
     bname = 'BRDC00IGS_R_' + str(year) + cdoy + '0000_01D_MN.rnx'
     filename = bname + '.gz'
     print(dir_secure, filename)
-    cddis_download(filename,dir_secure)
+    cddis_download_2022B(filename,dir_secure)
     status = subprocess.call(['gunzip', filename])
     if os.path.exists(bname):
         foundit = True
         name = bname
     return name, fdir, foundit
 
+
+
+def rinex_nrcan_highrate(station, year, month, day):
+    """
+    picks up 1-Hz RINEX 2.11 files from NRCAN
+    requires gfzrnx or teqc to merge the 15 minute files
+
+    Parameters
+    ----------
+    station: string
+        4 character station name
+    year: integer
+        year
+    month: integer
+        month or day of year if day is set to zero
+    day: integer
+        day
+
+
+    """
+    crnxpath = hatanaka_version()
+    teqcpath = teqc_version()
+    gfzrnxpath = gfz_version()
+    alpha='abcdefghijklmnopqrstuvwxyz'
+    # if doy is input
+    if day == 0:
+        doy=month
+        d = g.doy2ymd(year,doy);
+        month = d.month; day = d.day
+    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+    # NRCAN moving to new server names,
+    gns = 'ftp://cacsa.nrcan.gc.ca/gps/data/hrdata/' +cyy + cdoy + '/' + cyy + 'd/'
+
+
+    foundFile = 0
+    print('WARNING: downloading highrate RINEX data is a slow process')
+    s1 = time.time()
+    for h in range(0,24):
+        # subdirectory
+        ch = '{:02d}'.format(h)
+        print('\n Hour: ', ch)
+        for e in ['00', '15', '30', '45']:
+            dname = station + cdoy + alpha[h] + e + '.' + cyy + 'd.Z'
+            dname1 = station + cdoy + alpha[h] + e + '.' + cyy + 'd'
+            dname2 = station + cdoy + alpha[h] + e + '.' + cyy + 'o'
+            url = gns +  ch + '/' + dname
+            if os.path.isfile(dname2):
+                print('file exists:',dname2)
+                foundFile = foundFile + 1
+            else:
+                print(url)
+                try:
+                    wget.download(url,dname)
+                    subprocess.call(['uncompress',dname])
+                    subprocess.call([crnxpath, dname1])
+                    subprocess.call(['rm',dname1])
+                    foundFile = foundFile + 1
+                except:
+                    okok = 1
+
+    print('Found ', foundFile ,' individual files')
+    if (foundFile == 0):
+        print('Nothing to merge. Exiting.')
+        return
+    if (not os.path.isfile(gfzrnxpath)) and (not os.path.isfile(teqcpath)):
+        print('teqc and gfzrnx are missing. I have nothing to merge these files with. Exiting')
+        sys.exit()
+
+    searchpath = station + cdoy + '*.' + cyy + 'o'
+    print(searchpath)
+    if os.path.isfile(gfzrnxpath) and (foundFile > 0):
+        rinexname = station + cdoy + '0.' + cyy + 'o'
+        print('Attempt to merge the 15 minute files using gfzrnx and move to ', rinexname)
+        tmpname = station + cdoy + '0.' + cyy + 'o.tmp'
+        subprocess.call([gfzrnxpath,'-finp', searchpath, '-fout', tmpname, '-vo','2','-f','-q'])
+        cm = 'rm ' + station + cdoy + '*o'
+        if os.path.isfile(tmpname):
+            # try to remove the 15 minute files
+            subprocess.call(cm,shell=True)
+            subprocess.call(['mv',tmpname,rinexname])
+            s2 = time.time(); print('That took ', int(s2-s1), ' seconds.')
+        return
+
+    if (os.path.isfile(teqcpath)) and (foundFile > 0):
+        foutname = 'tmp.' + station + cdoy
+        rinexname = station + cdoy + '0.' + cyy + 'o'
+        print('Attempt to merge the 15 minute files with teqc and move to ', rinexname)
+
+        mergecommand = [teqcpath + ' +quiet ' + station + cdoy + '*o']
+        fout = open(foutname,'w')
+        subprocess.call(mergecommand,stdout=fout,shell=True)
+        fout.close()
+        cm = 'rm ' + station + cdoy + '*o'
+        if os.path.isfile(foutname):
+            # try to remove the 15 minute files
+            subprocess.call(cm,shell=True)
+            subprocess.call(['mv',foutname,rinexname])
+            s2 = time.time(); print('That took ', int(s2-s1), ' seconds.')
+        return
+
+
+def translate_dates(year,month,day):
+    """
+    i do not think this is used
+
+    """
+    if (day == 0):
+        doy=month
+        d = doy2ymd(year,doy);
+        month = d.month; 
+        day = d.day
+        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day); 
+    else:
+        doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day); 
+
+    return doy, cdoy, cyyyy, cyy
+
+
+def bfg_password(**kwargs):
+    """
+    Picks up BFG userid and password that is stored in a pickle file
+    in your REFL_CODE/Files/passwords area
+    If it does not exist, it asks you to input the values and stores them for you.
+
+    Allows you to send another name for your password
+
+    Returns  
+    -------
+    userid : str
+        BFG username
+    passpord : str 
+        password for archive 
+    """
+
+    # default is bfg
+    archive = kwargs.get('archive','bfg')
+    print('Using archive ', archive)
+
+    fdir = os.environ['REFL_CODE']
+    if not os.path.isdir(fdir):
+        print('You need to define the REFL_CODE environment variable')
+        return
+
+    # make sure the directory exists to store passwords
+    if not os.path.isdir(fdir + '/Files'):
+        subprocess.call(['mkdir',fdir + '/Files'])
+    if not os.path.isdir(fdir + '/Files/passwords'):
+        subprocess.call(['mkdir',fdir + '/Files/passwords'])
+
+
+    userinfo_file = fdir + '/Files/passwords/' + archive + '.pickle'
+
+    #print('user information file', userinfo_file)
+
+    #print('Will try to pick up BFG account information',userinfo_file)
+    if os.path.exists(userinfo_file):
+        with open(userinfo_file, 'rb') as client_info:
+            login_info = pickle.load(client_info)
+            user_id = login_info[0]
+            passport = login_info[1]
+    else:
+        user_id = getpass.getpass(prompt='Userid: ', stream=None)
+        passport= getpass.getpass(prompt='Password: ', stream=None)
+        # save to a file
+        with open(userinfo_file, 'wb') as client_info:
+            pickle.dump((user_id,passport) , client_info)
+        print('User id and password saved to', userinfo_file)
+
+    return user_id, passport
+
+def bfg_data(fstation, year, doy, samplerate=30,debug=False):
+    """
+    Picks up a RINEX3 file from BFG network
+
+    Parameters 
+    -----------
+    fstation: string
+        4 char station ID
+    year: integer
+        year
+    doy: integer
+        day of year
+    samplerate: integer
+        sample rate of the receiver (default is 30)
+    debug: boolean
+        directory file listing provided if true
+        default is false
+
+    """
+    cdoy = '{:03d}'.format(doy)
+    cyyyy = str(year)
+
+    #### these are for RINEX 3 data from the BFG network
+    country_code = 'DEU'#'NLD'#country code for rinex 3 file name
+    rinex_rate = '{:02d}'.format(samplerate)  + 'S'
+    data_server='ftp.bafg.de' # ftp server
+    rinex_dirc='/obs/' #directory on the ftp server
+
+    user_id, passport = bfg_password()
+
+    ftp=FTP(data_server) #log in to server
+    ftp.login(user=user_id, passwd = passport)
+    ftp.cwd(rinex_dirc) #change to the directory
+
+    command=cyyyy + '/'+ cdoy +'/' #issue command to go to the folder
+    #print('Looking at ', year, command, fstation,rinex_rate)
+    #print(data_server+rinex_dirc + command)
+    #fileid = open('bfg_listing.txt','w+')
+    try:
+        ftp.cwd(command) #change to that directory
+        files=ftp.nlst() #list files in the directory
+        for f in files:
+            station = f[0:4]
+            if (station == fstation.upper()) and ('crx' in f):
+                if (rinex_rate in f):
+                    print('downloading', f, ' and ', rinex_rate)
+                    ftp.retrbinary('RETR '+f, open(f,'wb').write)
+    except:
+        files = []
+        print('Exiting - most likely because that directory -and thus the data - does not exist.')
+
+    if debug:
+        for f in files:
+            print(f)
+
+    ftp.quit()
+    return
+
+def inout(c3gz):
+    """
+    Takes a Hatanaka rinex3 file that has been gzipped
+    gunzips it and decompresses it 
+
+    Parameters
+    ----------
+    c3gz : string
+        name of a gzipped hatanaka compressed RINEX 3 filename
+
+    Returns
+    -------
+    translated : boolean
+        whether file was successfully translated or not 
+
+    rnx : string
+        filename of the uncompressed and de-Hatanaka'ed RINEX file
+
+    """
+
+    translated = False # assume failure
+    c3 = c3gz[:-3] # crx filename
+    rnx = c3.replace('crx','rnx') # rnx filename
+    # gunzip
+    if os.path.exists(c3gz):
+        subprocess.call(['gunzip', c3gz])
+
+    # executable
+    crnxpath = hatanaka_version()
+    if not os.path.exists(crnxpath):
+        hatanaka_warning()
+    else:
+        if os.path.exists(c3): # file exists
+            subprocess.call([crnxpath,c3])
+    if os.path.exists(rnx): # file exists
+        translated = True
+        subprocess.call(['rm','-f',c3])
+
+    return translated, rnx
+
+
+
+def ga_highrate(station9,year,doy,dec,deleteOld=True):
+    """
+    Attempts to download and merge highrate RINEX 3 files from GA
+
+    Parameters
+    ----------
+    station9 : str
+        nine character station name appropriate for rinex 3
+    year : int
+        full year
+    doy : int
+        day of year
+    dec : int
+        decimation value.  1 or 0 means no decimation
+    deleteOld : bool
+        whether to delete old rinex 3 files
+
+    Returns 
+    -------
+    rinex2 : string
+        rinex2 filename created by merging 96 files!
+    fexist : boolean
+        whether a rinex2 file was successfully created
+
+    """
+    station = station9[0:4].lower()
+    cyyyy = str(year)
+    cyy  = cyyyy[2:4]
+    cdoy = '{:03d}'.format(doy)
+    crnxpath = hatanaka_version()
+    gexe = gfz_version()
+    if not os.path.exists(gexe):
+        print('no gfzrnx executable. exiting.')
+        return
+
+    if not os.path.exists(crnxpath):
+        hatanaka_warning()
+        return
+    print('WARNING 1: Have some coffee, downloading 96 files of high-rate GPS data takes a long time.')
+    print('WARNING 2: Downloading 96 files of high-rate GPS data from Australia takes an even longer time.')
+    print('WARNING 3: Unless you are in Australia ...')
+    QUERY_PARAMS, headers = k.ga_stuff_highrate(station9, year, doy)
+    API_URL = 'https://data.gnss.ga.gov.au/api/rinexFiles/'
+    request = requests.get(API_URL, QUERY_PARAMS, headers=headers)
+
+    gobblygook = myfavoriteobs()
+    v=0
+    crate = str(dec)
+    rinex2 =  station + cdoy + '0.' + cyy + 'o'
+    if len(json.loads(request.content)) >= 1:
+        for query_response_item in json.loads(request.content):
+            file_url = query_response_item['fileLocation']
+            file_name = urlparse(file_url).path.rsplit('/', 1)[1]
+            newname = file_name[:-3]
+            rinexname = newname[:-3] + 'rnx'
+            v = v + 1
+            cv = '{:02d}'.format(v)
+            tmpname=  station + cdoy + '0.'  + cyy + 'o' + 'tmp' + cv
+            # if you ran the program previously and have the files online
+            if os.path.exists(rinexname):
+                print(cv, file_name, tmpname)
+                if (dec > 1):
+                    subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-smp', crate, '-f','-q'])
+                    # does not like using tmp names with sei input. because of course
+                    #subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-sei','out','-smp', crate, '-f','-q'])
+                else:
+                    subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-f','-q'])
+                    #subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-sei','out','-f','-q'])
+                #subprocess.call(['mv', rinex2,tmpname])
+            else:
+                if os.path.exists(file_name): # file exists
+                    print('file exists so gunzip it')
+                    subprocess.call(['gunzip', file_name])
+                else:
+                    # download and gunzip it
+                    print(file_name)
+                    g.replace_wget(file_url,file_name)
+                    #wget.download(file_url,file_name)
+                    subprocess.call(['gunzip', file_name])
+
+                # hatanaka uncompress it
+                if os.path.exists(newname):
+                    subprocess.call([crnxpath, newname])
+
+                if os.path.exists(rinexname):
+                    if (dec > 1):
+                        subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-smp', crate, '-f','-q'])
+                        #subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-sei','out','-smp', crate, '-f'])
+                    else:
+                        subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-f','-q'])
+                        #subprocess.call([gexe,'-finp', rinexname, '-fout', tmpname, '-vo','2','-ot', gobblygook, '-sei','out','-f'])
+                    #subprocess.call(['mv', rinex2,tmpname])
+
+# now merge them
+# it would be nice if someone would check to see if any were found ... 
+    searchpath =  station + cdoy + '0.' + cyy + 'o' + 'tmp*'
+    print(searchpath)
+    subprocess.call([gexe,'-finp', searchpath, '-fout', rinex2, '-vo','2','-f'])
+    fexist = False
+    if os.path.exists(rinex2):
+        fexist = True
+
+    # should always remove tmp files
+    searchpath =  station + cdoy + '0.'  + cyy + 'otmp*' 
+    cm ='rm -f ' + searchpath
+    subprocess.call(cm,shell=True)
+
+# remove detritus
+    if deleteOld:
+        searchpath = station9.upper()  + '*' + cyyyy + cdoy + '*rnx'
+        cm ='rm -f ' + searchpath
+        subprocess.call(cm,shell=True)
+        searchpath = station9.upper()  + '*' + cyyyy + cdoy + '*crx'
+        cm ='rm -f ' + searchpath
+        subprocess.call(cm,shell=True)
+    return rinex2, fexist
+
+
+def cddis_download_2022B_new(filename,directory):
+    """
+    download code for CDDIS using https and password
+
+    Parameters
+    ----------
+    filename : str
+        name of the rinex file or orbit file
+
+    directory : str
+        where the file lives at CDDIS
+
+    """
+    print('New way of CDDIS downloads')
+    basename = 'https://cddis.nasa.gov/archive'
+    url = basename + directory + filename
+    print(url)
+    # Makes request of URL, stores response in variable r
+    user,passw = cddis_password()
+
+# requests.get('https://httpbin.org/basic-auth/user/pass', auth=('user', 'pass'))
+    r = requests.get(url,auth=('user','passw'))
+
+    if (r.status_code == 200):
+# Opens a local file of same name as remote file for writing to
+        with open(filename, 'wb') as fd:
+            for chunk in r.iter_content(chunk_size=1000):
+                fd.write(chunk)
+
+# Closes local file
+        fd.close()
+    else:
+        print('File does not exist')
+
+def cddis_download_2022B(filename,directory):
+    """
+    Nth iteration of download code for CDDIS
+
+    Parameters
+    ----------
+    filename : str
+        name of the rinex file or orbit file
+
+    directory : str
+        where the file lives at CDDIS
+
+    """
+    #print('Original way of accessing CDDIS ')
+
+    ftps = FTP_TLS(host = 'gdc.cddis.eosdis.nasa.gov')
+    email = 'kristine.larson@colorado.edu'
+    ftps.login(user='anonymous', passwd=email)
+    ftps.prot_p()
+    ftps.cwd(directory)
+    #filelist = ftps.nlst()
+    #if filename in filelist:
+    ftps.retrbinary("RETR " + filename, open(filename, 'wb').write)
+    ftps.close()
+    siz = os.path.getsize(filename)
+    if siz == 0:
+        print('No file found')
+        subprocess.call(['rm',filename])
+    #else:
+    #    print('That file does not exist at CDDIS')
+
+
+def getnavfile_archive(year, month, day, archive):
+    """
+    picks up nav file from a specific archive and stores it in the ORBITS directory
+
+    Parameters
+    ----------
+    year: integer
+        full year
+    month: int
+        calendar month, or day of year
+    day: int
+        day of the month, or zero
+    archive : str
+        name of the GNSS archive. currently allow sopac and esa
+
+    Returns
+    -------
+    navname : str
+        name of navigation file (should always be auto???0.yyn, so unclear to me 
+        why it is sent)
+    navdir : str
+        location of where the file has been stored
+    foundit : bool
+        whether the file was found
+
+    """
+    # make sure directories exist for orbits
+    ann = make_nav_dirs(year)
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+    navname,navdir = nav_name(year, month, day)
+
+    foundit = check_navexistence(year,month,day)
+
+    if (not foundit):
+        if (archive == 'esa'):
+            foundit =get_esa_navfile(cyyyy,cdoy)
+        if (archive == 'sopac'):
+            xx = get_sopac_navfile(navname,cyyyy,cyy,cdoy)
+        # found it at one of the preferred archives
+        if (archive == 'cddis'):
+            get_cddis_navfile(navname,cyyyy,cyy,cdoy)
+        if os.path.exists(navname):
+            subprocess.call(['mv',navname, navdir])
+            foundit = True
+        else:
+            foundit = False
+
+    if (not foundit):
+        print('No navfile found at ', archive)
+
+    return navname,navdir,foundit
+
+def check_navexistence(year,month,day):
+    """
+    Check to see if you already have the nav file. Uncompresses it 
+    if necessary
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or doy if day is zero
+    day : int
+        day of month or 0 
+
+    Returns 
+    -------
+    foundit : boolean
+        whether nav file has been found
+    """
+    foundit = False
+    navname,navdir = nav_name(year, month, day)
+    nfile = navdir + '/' + navname
+    if not os.path.exists(navdir):
+        subprocess.call(['mkdir',navdir])
+    #print('Looking for ', navname, navdir)
+
+    if os.path.exists(nfile):
+        foundit = True
+    if (not foundit) and (os.path.exists(nfile + '.xz' )):
+        subprocess.call(['unxz',nfile + '.xz'])
+        foundit = True
+    if (not foundit) and (os.path.exists(nfile + '.gz' )):
+        subprocess.call(['gunzip',nfile + '.gz'])
+        foundit = True
+
+    if foundit:
+        print('Nav file exists online')
+
+    return foundit
+
+def ymd2ch(year,month,day):
+    """
+    returns doy and character versions of year,month,day
+    if day is zero, it assumes doy is in the month input
+
+    Parameters
+    ----------
+    year : int
+        full year
+
+    month : int
+        if day is zero this is day of yaer
+
+    day : int
+        day of month or zero 
+
+    Returns
+    -------
+    month : int
+        numerical month of the year
+    day : int
+        day of the month
+    doy : int
+        day of year
+    cyyyy : str
+        4 ch year
+    cyy : str
+        2 ch year
+    cdoy : str
+        4 ch year
+
+    """
+    if (day == 0):
+       doy=month
+       d = doy2ymd(year,doy);
+       month = d.month; day = d.day
+    doy,cdoy,cyyyy,cyy = ymd2doy(year,month,day)
+
+    return month, day, doy, cyyyy, cyy, cdoy
+
+def geoidCorrection(lat,lon):
+    """
+    Calculates the EGM96 geoid correction
+
+    Parameters
+    ----------
+    lat : float
+        latitude, degrees
+    lon : float
+        longitude, degrees
+
+    Returns
+    -------
+    geoidC : float
+        geoid correction in meters
+
+    """
+    # check that file exists
+    foundfile = checkEGM()
+    egm = EGM96.EGM96geoid()
+    geoidC = egm.height(lat=lat,lon=lon)
+
+    return geoidC
+
+def checkEGM():
+    """
+    Downloads and stores EGM96 file in REFL_CODE/Files for use in refl_zones
+
+    Returns
+    -------
+    foundfile : bool
+        whether EGM96 file was found (or installed) on your local machine
+
+    """
+    foundfile = False
+    xdir = os.environ['REFL_CODE']
+    matfile = 'EGM96geoidDATA.mat'
+    localdir = xdir + '/Files/'
+    if not os.path.isdir(localdir):
+        print('Making ', localdir)
+        subprocess.call('mkdir',localdir)
+
+    egm = localdir + matfile
+    if 'REFL_CODE' in os.environ:
+        egm = localdir + matfile
+        interiorfile = 'gnssrefl/' + matfile
+        if os.path.isfile(egm):
+            #print('EGM96 file exists')
+            foundfile = True
+        elif os.path.isfile(interiorfile):
+            print('cp EGM96 file to where it belongs')
+            subprocess.call(['cp',interiorfile, localdir])
+            foundfile = True
+        else:
+            print('EGM96 file does not exist. We will try to download and store it in ',localdir)
+            githubdir = 'https://raw.githubusercontent.com/kristinemlarson/gnssrefl/master/docs/'   
+            wget.download(githubdir+matfile, localdir + matfile)
+            if os.path.isfile(egm):
+                print('successful download, EGM file exists')
+                foundfile = True
+            else:
+                print('unsuccessful download')
+    else:
+        print('The REFL_CODE environment variable has not been set.')
+
+    return foundfile 
+
+def save_plot(plotname):
+    """
+    save plot and send location info to the screen
+
+    Parameters
+    ----------
+    plotname : str
+        name of output figure file
+    """
+    plt.savefig(plotname,dpi=300)
+    print('Plot file saved as: ', plotname)
+
+
+def make_azim_choices(alist):
+    """
+    not used yet
+
+    Parameters
+    ----------
+    alist : list of floats
+        azimuth pairs - must be even number of values, i.e.
+        [amin1, amax1, amin2, amax2]
+
+    azval : list of floats
+        azimuth regions for lomb scargle periodograms
+
+    """
+# want to make a list for make_json_input
+# lsp['azval'] = [0, 90, 90, 180, 180, 270, 270, 360]
+    if alist[0] < 0 | alist[-1] < 0 :
+        print('We do not currently allow negative azimuths ')
+        sys.exit()
+
+    if len(alist) == 2:
+        deltaA = np.diff(alist)
+        if (deltaA < 100):
+            azval = alist
+        elif (deltaA >=100) & (deltaA <= 180):
+            # divide by two
+            d = int(deltaA/2)
+            azval = [alist[0], alist[0] + d, alist[0] + d,  alist[-1]]
+        elif (deltaA >=180) & (deltaA <= 270):
+            # divide by three
+            d = int(deltaA/3)
+            azval = [alist[0], alist[0] + d, alist[0] + d,  
+                    alist[0] + 2*d, alist[0]+2*d, alist[-1]]
+        else:
+            # divide by three
+            d = int(deltaA/4)
+            azval = [alist[0], alist[0] + d, alist[0] + d,  alist[0] + 2*d, 
+                    alist[0]+2*d, alist[0] + 3*d, alist[0]+3*d, alist[-1]]
+    else:
+        print('We only allow one set of azimuth ranges at the current time') ; sys.exit()
+
+    print('Input Azlist: ', alist, ' Output list ', azval)
+
+    return azval
+
+def set_subdir(subdir):
+    """
+    make sure that subdirectory exists for output files 
+    should return the directory name ... 
+
+    Parameters
+    ----------
+    subdir : str
+        subdirectory in $REFL_CODE/Files
+
+    """
+    xdir = os.environ['REFL_CODE']
+    if not os.path.exists(xdir):
+        print('The REFL_CODE environment variable must be set')
+        print('This will tell the code where to put the output.')
+        sys.exit()
+
+    outdir = xdir  + '/Files/' + subdir 
+    if not os.path.exists(outdir) :
+        subprocess.call(['mkdir', '-p', outdir])
+
+    return
+
+
+def mjd_more(mmjd):
+    """
+    This is not working yet.  
+
+    Parameters
+    ----------
+    mmjd : float
+        mod julian date
+
+    Returns
+    -------
+    year : int
+        full year
+    mm : int
+        month
+    dd : int
+        day
+    doy : int
+        day of year
+    """
+    year,mm,dd = mjd_to_date(mmjd)
+    doy, cdoy, cyyyy, cyy = ymd2doy(year,mm,dd)
+
+    return year, mm, dd, doy 
+
+
+def quickazel(gweek,gpss,sat, recv,ephemdata,localup,East,North):
+    """
+    assumes you have read in the broadcast ephemeris,
+    know where your receiver is and the time (gps week, second of week)
+    """
+    closest = myfindephem(gweek, gpss, ephemdata, sat)
+    eleA = 0; azimA = 0
+    if len(closest) > 0:
+        #print(gweek,gpss,sat)
+        satv = rnx.satorb_prop(gweek, gpss, sat, recv, closest)
+        r=np.subtract(satv,recv) # satellite minus receiver vector
+        eleA = elev_angle(localup, r)*180/np.pi
+        azimA = azimuth_angle(r, East, North)
+        #print('el/az',eleA, azimA)
+    return eleA, azimA
+
+def quickp(station,t,sealevel):
+    """
+    makes a quick plot of sea level 
+    prints the plot to the screen - it does not save it.
+
+    Parameters
+    ----------
+    station : str
+        station name
+    t : numpy array in datetime format
+        time of the sea level observations UTC
+    sealevel : list of floats
+        meters (unknown datum)
+
+    """
+    fs = 10
+    if (len(t) > 0):
+        fig,ax=plt.subplots(figsize=(10,5))
+        ax.plot(t, sealevel, 'b-')
+        plt.title('Water Levels: ' + station.upper())
+        plt.xticks(rotation =45,fontsize=fs);
+        plt.ylabel('meters')
+        plt.grid()
+        fig.autofmt_xdate()
+        plt.show()
+    else:
+        print('no data found - so no plot')
+    return
+
+
+def cddis_restriction(iyear, idoy,archive):
+    """
+    CDDIS has announced a restructuring of their archive.
+    After 6 months files are tarred. It would be ok for the code
+    to accommodate this change, but it will have to come from the community.
+    If six months has passed since you ran the code, a warning will come to the 
+    screen and the code will exit.
+
+    Updated now that i realize BKG does the same thing
+
+    Parameters
+    ----------
+    iyear : int
+        year you want to download from CDDIS
+    idoy : int
+        day of year you want to download from CDDIS
+
+    archive : str
+        name of archive
+
+    Returns
+    -------
+    bad_day : bool
+        if bad_day is true, you cannot access high-rate data from CDDIS or BKG
+
+    """
+# find out today's date
+    year = int(date.today().strftime("%Y"));
+    month = int(date.today().strftime("%m"));
+    day = int(date.today().strftime("%d"));
+
+    today=datetime.datetime(year,month,day)
+    doy = (today - datetime.datetime(today.year, 1, 1)).days + 1
+    tdate = year + doy/365.25
+
+    # input date
+    idate = iyear + idoy/365.25
+
+    if (tdate - idate) > 0.5:
+        # i.e. half a year is six months
+        bad_day =  True
+        print(archive.upper() + ' does not allow direct access to their high-rate data for this day and year. ')
+        print('They now tar files six months after the data archived - but force you to merge them.')
+        print('I have installed a solution for this problem for CDDIS and BKG.')
+
+    else:
+        bad_day = False
+
+
+    return bad_day
+
+
+def cddis_password():
+    """
+    Picks up cddis userid and password that is stored in a pickle file
+    in your REFL_CODE/Files/passwords area
+    If it does not exist, it asks you to input the values and stores them for you.
+
+    Returns
+    -------
+    userid : str
+        cddis username
+
+    password : str
+        cddis password
+
+    """
+
+    fdir = os.environ['REFL_CODE']
+    if not os.path.isdir(fdir):
+        print('You need to define the REFL_CODE environment variable')
+        return
+
+    # make sure the directory exists to store passwords
+    if not os.path.isdir(fdir + '/Files'):
+        subprocess.call(['mkdir',fdir + '/Files'])
+    if not os.path.isdir(fdir + '/Files/passwords'):
+        subprocess.call(['mkdir',fdir + '/Files/passwords'])
+
+    userinfo_file = fdir + '/Files/passwords/' + 'cddis.pickle'
+    #print('user information file', userinfo_file)
+
+    #print('Will try to pick up BFG account information',userinfo_file)
+    if os.path.exists(userinfo_file):
+        with open(userinfo_file, 'rb') as client_info:
+            login_info = pickle.load(client_info)
+            user_id = login_info[0]
+            passport = login_info[1]
+    else:
+        print('You need a earthdata account to access NASA data.')
+        print('https://urs.earthdata.nasa.gov/')
+        user_id = getpass.getpass(prompt='Userid: ', stream=None)
+        passport= getpass.getpass(prompt='Password: ', stream=None)
+        # save to a file
+        with open(userinfo_file, 'wb') as client_info:
+            pickle.dump((user_id,passport) , client_info)
+        print('User id and password saved to', userinfo_file)
+
+    return user_id, passport
+
+
+
+def gbm_orbits_direct(year,month,day):
+    """
+    downloads gfz multi-gnss orbits, aka gbm orbits, directly from GFZ.
+    thus avoids CDDIS.  it first checks to see if you have the files online.
+    both version of the long name.
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month number or day of year if day is set to zero
+    day : int
+        calendar day of month
+
+    """
+    foundit = False
+    return_name = ''
+
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+    gpsweek,sec=kgpsweek(year,month,day,0,0,0)
+    cgpsweek = str(gpsweek)
+
+    # they changed during 2245 ... 
+    if (gpsweek < 2245):
+        gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/mgex/' + cgpsweek + '/'
+    else:
+        gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/mgex/' + cgpsweek + '_IGS20/'
+
+    # this has now been changed again ... sigh
+
+    fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
+    littlename = 'gbm' + str(gpsweek) + str(int(sec/86400)) + '.sp3'
+    bigname = 'GFZ0MGXRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3'
+
+    bigname2 = 'GBM0MGXRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3'
+    print(bigname, bigname2)
+
+    # first, do you have it locally?  
+    # look for compressed file
+    fullname = fdir + '/' + littlename 
+    if os.path.isfile(fullname):
+        foundit = True
+        return_name = littlename
+    elif os.path.isfile(fullname + '.gz'):
+        subprocess.call(['gunzip', fullname + '.gz'])
+        foundit = True; 
+        return_name = littlename
+
+    if not foundit:
+        fullname = fdir + '/' + bigname 
+        if os.path.isfile(fullname):
+            foundit = True
+            return_name = bigname
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True; 
+            return_name = littlename
+
+    # checked for the first kind of name because that is how it was stored on CDDIS.
+    # now use the name as how it is stored at GFZ.  I think
+    bigname = bigname2 
+    if not foundit:
+        url = gns + littlename + '.Z'
+        print(url)
+        try:
+            wget.download(url,littlename + '.Z')
+            subprocess.call(['uncompress', littlename + '.Z'])
+        except:
+            okok = 1
+
+        if os.path.isfile(littlename):
+            foundit = True ; return_name = littlename
+        else:
+            url = gns + bigname + '.gz'
+            print(url)
+            try:
+                wget.download(url,bigname + '.gz')
+                subprocess.call(['gunzip', bigname + '.gz'])
+                foundit = True ; return_name = bigname
+            except:
+                okok = 1
+
+
+    # store the file
+    if os.path.isfile(littlename):
+        store_orbitfile(littlename,year,'sp3') ; 
+    elif os.path.isfile(bigname):
+        store_orbitfile(bigname,year,'sp3') ; 
+
+    if not foundit:
+        print('Orbit was not found at GFZ or in a local directory')
+    #else:
+    #    print('Orbit found')
+
+    return return_name, fdir, foundit
+
+
+def checkFiles(station, extension):
+    """
+    apparently no one consistently checks for the Files directory existence.
+    this is an attempt to fix that.
+
+    Parameters
+    ----------
+    station : str
+        4 ch station ID
+
+    extension : str
+        subdirectory for results in $REFL_CODE/Files/station
+
+    """
+    xdir = os.environ['REFL_CODE']
+    if not os.path.isdir(xdir):
+        print('REFL_CODE environment variable has not been set. Exiting')
+        sys.exit()
+
+    txtdir = xdir + '/Files/' 
+    if not os.path.exists(txtdir) :
+        subprocess.call(['mkdir', txtdir])
+        print(txtdir , ' has been created.')
+    txtdir = xdir + '/Files/'  + station
+    if not os.path.exists(txtdir) :
+        subprocess.call(['mkdir', txtdir])
+        print(txtdir , ' has been created.')
+
+    if (len(extension) > 0):
+        txtdir = xdir + '/Files/'  + station + '/' + extension
+        if not os.path.exists(txtdir) :
+            subprocess.call(['mkdir', txtdir])
+            print(txtdir , ' has been created')
+
+
+def read_leapsecond_file(mjd):
+    """
+    reads leap second file and tries to figure out the UTC-GPS time offset
+    needed for NMEA file users for the given MJD value
+
+    It will download and store the leap second file in REFL_CODE/Files if 
+    you don't already have it.
+
+    Parameters
+    ----------
+    mjd : float
+        Modified Julian Day for when you want to know the leap seconds since
+        GPS began
+
+    Returns
+    -------
+    offset : int
+        UTC-GPS time offset in seconds. This should be added to UTC to get GPS
+
+    """
+    offset = 0
+    xdir = os.environ['REFL_CODE']
+    if not os.path.isdir(xdir):
+        print('REFL_CODE environment variable has not been set. Exiting')
+        sys.exit()
+    # Fire currently loaded here
+    xdir = os.environ['REFL_CODE'] + '/input'
+    if not os.path.isdir(xdir):
+         subprocess.call(['mkdir', xdir])
+
+    # in case you decide to put it here
+    xdir = os.environ['REFL_CODE'] + '/Files'
+    if not os.path.isdir(xdir):
+         subprocess.call(['mkdir', xdir])
+
+    # I changed it to look for leap second file in Files
+    xdir = os.environ['REFL_CODE'] + '/Files/leapseconds.txt' 
+    # if file is not on your system, download it
+    if not os.path.isfile(xdir):
+        print('Trying to download leapsecond file from github')
+        url= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/leapseconds.txt'
+        print(url)
+        wget.download(url,xdir)
+    if not os.path.isfile(xdir):
+        print('Trying to download leapsecond file from morefunwithgps')
+        url = 'https://morefunwithgps.com/public_html/leapseconds.txt'
+        print(url)
+        wget.download(url,xdir)
+    if not os.path.isfile(xdir):
+        print('Could not find the leap second file. Exiting.')
+        sys.exit()
+
+    tv = np.loadtxt(xdir,usecols=(1),comments='%')
+    N = len(tv)
+    # these leap seconds are set to dec 31 or june 30 but are applied at midnight
+    # so add one day ...
+    tv = tv + 1
+    # add a value to an end point
+    for i in range(0,N):
+        #print(i,tv[i], mjd)
+        if (i == (N-1)):
+            #print('found the correct leap second ',i+1)
+            offset = i+1
+        elif (mjd > tv[i] ) & (mjd < tv[i+1]):
+            #print('found the correct leap second ',i+1)
+            offset = i+1
+            break
+
+    return offset
+
+def ydoy2datetime(y,doy):
+    """
+    translates year/day of year numpy array into datetimes for plotting
+
+    this was running slow for large datasets.  changing to use lists
+    and then asarray to numpy
+
+    Parameters
+    ----------
+    y : numpy array of floats
+        full year
+    doy : numpy array of floats
+        day of year
+
+    Returns
+    -------
+    bigT : numpy array
+        datetime objects
+
+    """
+    obstimes = []
+    obstimes_list = []
+    N = len(y)
+    for i in range (0,N):
+        yy = int( y[i] );
+        ddoy = int(doy[i])
+        d = datetime.datetime(yy, 1, 1) + datetime.timedelta(days=(ddoy-1))
+        #print(yy,ddoy,d.month,d.day)
+        bigT = datetime.datetime(year=yy, month=d.month, day=d.day)
+        #obstimes = np.append(obstimes,bigT)
+        obstimes_list.append(bigT)
+
+    obstimes = np.asarray(obstimes_list)
+
+    return obstimes
+
+def unr_database(file1, file2, database_file):
+    """
+    Checks to see if the database lives in either file1 or file2
+    locations. Stem of the filename is third input, database_file
+
+    Parameters
+    ----------
+    file1 : str
+        full name of database in $REFL_CODE/Files
+    file2 : str
+        full name of database in local gnssrefl directory
+    database_file : str
+        database file name
+
+    Returns
+    -------
+    exists_now : bool
+        whether you were successful in finding the database 
+    database_location : str
+        full name of the database you found and want to use going on
+
+    """
+    # get the new database
+    exists_now = True
+    exist1 = os.path.isfile(file1)
+    exist2 = os.path.isfile(file2)
+
+    if (not exist1) & (not exist2):
+        url1= 'https://github.com/kristinemlarson/gnssrefl/raw/master/gnssrefl/' + database_file
+        print('Try to download the station database from github for you:', url1)
+        print('If you are not online, it will fail.')
+        print('If you are able to manually download the file')
+        print('it should be stored in the $REFL_CODE/Files directory')
+        try:
+            wget.download(url1,file1)
+            exists_now = True
+        except:
+            print('Could not download the new UNR database for you')
+            exists_now = False
+
+    exist1 = os.path.isfile(file1)
+    exist2 = os.path.isfile(file2)
+
+    if (not exist1) & exist2:
+        print('cp from local directory to Files directory because that is where it goes')
+        subprocess.call(['cp', file2, file1])
+
+    # just to be sure
+    if (not exist1) & (not exist2):
+        exists_now = False
+
+    return exists_now , file1
+
+
+def modjul_to_ydoy(MJD):
+    """
+    yet another data translation function.  when will it end?
+    Modified Julian Day to Year, Doy
+
+    Parameter
+    ========
+    MJD: float
+        modified julian day
+
+    Returns
+    =======
+    year : int
+        full year
+    doy : int
+        day of year
+    """
+    year,mm,dd = mjd_to_date(MJD)
+    doy, cdoy, cyyyy, cyy = ymd2doy(year,mm,dd)
+
+    return year, doy
+
+
+def randomfilename():
+    """
+    makes a string -length 9 - using random number
+    generator.  useful for filenames
+
+    Returns
+    -------
+    rname : str
+        filename with nine random numerical characters
+
+    """
+    a=math.modf(random())
+    xx = int(math.floor(a[0]*1000000000))
+    # make sure it is length 9
+    rname = '{:09d}'.format(xx)
+    return rname
+
+
+def replace_wget(url,f,**kwargs):
+    """
+    use requests instead of wget to download files
+    this cannot be used for ftp addresses.
+
+    added optional input parameter timeout
+
+    Parameters
+    ----------
+    url : str
+        full path to file
+    f : str
+        filename
+    timeout : int
+        optional timeout parameter, seconds
+
+    Returns
+    -------
+    success : bool
+        whether file was found or not
+    """
+    timeout = kwargs.get('timeout',0)
+    # use a try in case the website is down
+    try:
+        if (timeout > 0):
+            response = requests.get(url,timeout=timeout)
+        else:
+            response = requests.get(url)
+        #print(response.status_code)
+        if response.status_code == 200:
+            with open(f, "wb") as file:
+                file. write(response.content)
+            success = True
+        else:
+            success = False
+    except:
+        print('No file downloaded')
+        success = False
+
+    if success: 
+        print("Successful download:", f)
+
+    return success
+
+def define_logdir(station,year,doy):
+    """
+    creates logfile name and directory (for rinex2snr) 
+    given a station, year and day of year
+
+    Parameters
+    ----------
+    station : str
+        4 ch station name
+    year : int
+        full year
+    doy : int
+        day of year
+    """
+    cyyyy,cyy,cdoy = ydoych(year,doy)
+
+    xdir = os.environ['REFL_CODE']
+
+    # universal location for the log directory
+    logdir = xdir + '/logs/' + station + '/' + cyyyy + '/'
+
+    # define directory for the 
+    if not os.path.isdir(logdir):
+        subprocess.call(['mkdir', '-p',logdir])
+
+    logname = cdoy + '_translation.txt'
+
+    return logdir, logname
+
+
+def noaa2me(date1):
+    """
+    converts NOAA type of date string to simple integers
+
+    Parameters
+    ----------
+    date1 : string
+        time in format YYYYMMDD for year month and day
+
+    Returns
+    -------
+    year1 : integer
+        full year
+
+    month1 : integer
+        month
+
+    day1 : integer
+        day of the month
+
+    doy : integer
+        day of year
+
+    modjulday : float
+        modified julian date
+
+    """
+    year1 = int(date1[0:4]);
+    month1=int(date1[4:6]);
+    day1=int(date1[6:8])
+    doy, cdoy, cyyyy, cyy =ymd2doy(year1, month1, day1)
+
+    mj, fj = mjd(year1, month1, day1, 0, 0, 0)
+    modjulday = mj + fj;
+
+    return year1, month1, day1, doy, modjulday
+
+def noaatime_to_obstime(noaa):
+    """
+    stitching together something to convert string
+    with year, month, day and returning obstime
+
+    Parameters
+    ----------
+    noaa : str
+        year, month, day (e.g. 20220115)
+
+    Returns
+    -------
+    obstime : datetime
+        time in datetime format
+
+    """
+    year1, month1, day1, doy1, modjulday1 = noaa2me(noaa)
+    obstime =  sd.mjd_to_obstimes(modjulday1)
+
+    return obstime
+
+
+def trignet(station,year,doy):
+    """
+    tries to pick up 30 sec RINEX 2.11 data from TRIGNET
+
+    Parameters
+    ----------
+    station : str
+        station name
+    year : int
+        full year
+    doy : int
+        day of year
+    Returns
+    -------
+    fexist : bool
+        whether you succeeded
+
+    """
+    cyyyy,cyy,cdoy = ydoych(year,doy)
+    data_server = 'ftp.trignet.co.za'
+    fexist = False
+
+    try:
+        ftp=FTP(data_server) #log in to server
+        ftp.login(user='anonymous', passwd='kristine@colorado.edu')
+        rinex_dirc = 'RefData.' + cyy + '/' + cdoy + '/L1L2_30sec/'
+        ftp.cwd(rinex_dirc) #change to the directory
+        files=ftp.nlst() #list files in the directory
+        for f in files:
+            if station.upper() in f:
+                print(f)
+                ftp.retrbinary('RETR '+f, open(f,'wb').write)
+        ftp.close()
+    except:
+        print('no file found ', cyyyy, cdoy)
+    the_zipfile = station.upper() + cdoy + 'Z.zip'
+
+    if os.path.exists(the_zipfile):
+        station_u = station.upper() + cdoy + 'z.' + cyy 
+        station_l = station.lower() + cdoy + '0.' + cyy 
+    # in case they are there
+        subprocess.call(['rm', '-f','unpack.bat'])
+        subprocess.call(['rm', '-f','CRX2RNX.EXE'])
+        try:
+            archive = zipfile.ZipFile(the_zipfile, 'r')
+            subprocess.call(['unzip', the_zipfile])
+            subprocess.call(['rm', '-f',station.upper() + cdoy + 'Z.' + cyy + 'q'])
+            subprocess.call(['rm', '-f',station.upper() + cdoy + 'Z.' + cyy + 'n'])
+            subprocess.call(['rm', '-f',station.upper() + cdoy + 'Z.zip'])
+            if os.path.exists(station_u +'d'):
+                subprocess.call(['mv', station_u + 'd', station_l + 'd' ])
+                subprocess.call(['rm', '-f','unpack.bat'])
+                subprocess.call(['rm', '-f','CRX2RNX.EXE'])
+
+                crnxpath = hatanaka_version()
+                subprocess.call([crnxpath, station_l + 'd'])
+                subprocess.call(['rm', '-f',station_l + 'd'])
+
+        except:
+            print('probably a corrupt zipfile, but who knows')
+    # remove crap
+        if os.path.exists(station_l + 'o'):
+            fexist = True
+            print('Found RINEX ', station_l + 'o')
+
+    return fexist
+
+def new_ultra_gfz_orbits(year, month, day, hour):
+    """
+    downloads gfz ultra rapid orbit and stores in $ORBITS locally
+    this is for the two day version with long file names that became
+    the only access point in early June 2024
+
+    to use this code properly for day N you should call it for 
+    day N-1 need because GFZ creates a two day file, and the file
+    is named for day N-1
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year if day is set to zero
+    day : int
+        day of month
+    hour : int
+        hour for ultrarapid
+
+    Returns
+    -------
+    littlename : str
+        name of the orbit file
+    fdir: str
+        name of the file directory where orbit is stored
+    foundit : bool
+        whether file was found
+
+    """
+    hours_allowed = [0,3,6,9,12,15,18,21]
+    if hour not in hours_allowed:
+        print('You chose an illegal hour - setting to zero')
+        print('These are allowed ', hours_allowed)
+        hour = 0
+        
+    if day == 0:
+        # this means someone submitted doy in the month place
+        # which is not great - but allowed
+        y, m, d = ydoy2ymd(year, month)
+        month = m; day = d
+
+    chour = '{:02d}'.format(hour)
+    foundit = False
+    dday = 2021 + 137/365.25 # when GFZ started making these products
+    dday2 = 2024 + 149/365.25 # when GFZ stopped making the old files.
+    # get GPS week number
+    wk,sec=kgpsweek(year,month,day,0,0,0)
+
+    gns = 'ftp://ftp.gfz-potsdam.de/pub/GNSS/products/ultra/'
+
+    new_gns = 'ftp://isdcftp.gfz-potsdam.de/gnss/products/ultra/'
+
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
+    fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
+    littlename = 'gfz' + str(wk) + str(int(sec/86400)) + '.sp3'
+    #          'GFZ0OPSULT_20241620000_02D_05M_ORB.SP3
+    longname = 'GFZ0OPSULT_' + cyyyy + cdoy + chour + '00_02D_05M_ORB.SP3'
+    #longname = 'GFZ0OPSULT_' + cyyyy + cdoy + '0000_02D_05M_ORB.SP3'
+    url = gns + 'w' + str(wk) + '/' + littlename + '.gz'
+    url2 = new_gns + 'w' + str(wk) + '/' + longname + '.gz'
+    if (year + doy/365.25) < dday:
+        print('No rapid GFZ orbits until 2021/doy137')
+        return '', '', foundit
+
+    if (year + doy/365.25) > dday2:
+        print('Use the second site and name for download: ', url2)
+        fullname = fdir + '/' + longname 
+        if os.path.isfile(fullname):
+            foundit = True
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True
+        else:
+            try:
+                wget.download(url2, longname + '.gz')
+                if os.path.isfile(longname + '.gz'):
+                    subprocess.call(['gunzip', longname + '.gz'])
+                    store_orbitfile(longname,year,'sp3') ; 
+                foundit = True
+            except:
+                print('problems downloading Ultra GFZ orbit (2)')
+
+        return longname, fdir, foundit
+
+    else:
+        print('Try first site and name for download : ',url)
+        fullname = fdir + '/' + littlename
+        if os.path.isfile(fullname):
+            foundit = True
+        elif os.path.isfile(fullname + '.xz'):
+            subprocess.call(['unxz', fullname + '.xz'])
+            foundit = True
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True
+        else:
+            try:
+                wget.download(url,littlename + '.gz')
+                if os.path.isfile(littlename + '.gz'):
+                    subprocess.call(['gunzip', littlename + '.gz'])
+                    foundit = True
+            except:
+                print('Problems downloading Ultra GFZ orbit (1)')
+
+            if os.path.isfile(littlename):
+                store_orbitfile(littlename,year,'sp3') ; foundit = True
+
+        print('/n')
+        return littlename, fdir, foundit
+
+def newish_gfz_orbits(year,month,day, orbtype):
+    """
+    downloads "newish" gfz final and rapid orbits and stores in $ORBITS locally
+    Uses isdcftp instead original GFZ ftp site
+    final are 15 minute files and rapid are 5 minute
+    uses different name than at CDDIS?
+
+    Parameters
+    ----------
+    year : int
+        full year
+    month : int
+        month or day of year if day is set to zero
+    day : int
+        day of month
+    orbtype : str
+        kind of orbit, rapid or final
+
+    Returns
+    -------
+    littlename : str
+        name of the orbit file
+    fdir: str
+        name of the file directory where orbit is stored
+    foundit : bool
+        whether file was found
+
+    """
+    foundit = False
+    dday2 = 2024 # have to check 
+    if day == 0:
+        year,month,day = ydoy2ymd(year, month)
+
+    wk,sec = kgpsweek(year,month,day,0,0,0)
+
+    new_gns = 'ftp://isdcftp.gfz-potsdam.de/gnss/products/' + orbtype + '/'
+
+    month, day, doy, cyyyy, cyy, cdoy = ymd2ch(year,month,day)
+
+
+    fdir = os.environ['ORBITS'] + '/' + cyyyy + '/sp3'
+    if orbtype == 'rapid':
+        longname = 'GFZ0OPSRAP_' + cyyyy + cdoy + '0000_01D_05M_ORB.SP3'
+    else:
+        longname = 'GFZ0OPSFIN_' + cyyyy + cdoy + '0000_01D_15M_ORB.SP3'
+
+    url2 = new_gns + 'w' + str(wk) + '/' + longname + '.gz'
+
+    if (year + doy/365.25) < dday2:
+        print('For now only searching for GFZ data from 2024 on')
+        print('If this should be changed, submit a pull request')
+    else:
+        fullname = fdir + '/' + longname 
+        if os.path.isfile(fullname):
+            foundit = True
+        elif os.path.isfile(fullname + '.gz'):
+            subprocess.call(['gunzip', fullname + '.gz'])
+            foundit = True
+        else:
+            print('Use the new GFZ ftp site: ', url2)
+            try:
+                wget.download(url2, longname + '.gz')
+                if os.path.isfile(longname + '.gz'):
+                    subprocess.call(['gunzip', longname + '.gz'])
+                    store_orbitfile(longname,year,'sp3') ; 
+                foundit = True
+            except:
+                print('problems downloading GFZ orbit ')
+
+    return longname, fdir, foundit
+
+def print_version_to_screen():
+    """
+    what it sounds like
+    """
+    print('gnssrefl version:', str(version('gnssrefl')), '\n')
+    return
+
+def greenland_rinex3(station,year,doy,stream,samplerate):
+    """
+    downloads RINEX3 files from GNET. Returns hatanaka and gzipped file.
+    Could uncompress and convert, but downstream code expects *crx.gz
+
+    It requires you have a GNET password. The first time you call this 
+    function it will ask for the username and password and it will store 
+    it locally.  
+
+    You must have installed lftp on your own. (gnssrefl will not do it for you).
+
+    stream and samplerate parameters REQUIRED
+
+    Only allows one day files
+
+    Parameters
+    ----------
+    station : str
+        long station name
+    year : int
+        full year
+    doy : int
+        day of year
+    stream : str
+        stream ID
+    samplerate : int 
+        seconds
+
+    Returns
+    -------
+    filename : str
+        rinex3 filename(hatanaka compressed and gzipped)
+
+    found : bool
+        whether file was found
+    """
+    crnxpath = hatanaka_version()
+
+    found = False
+    cdoy = '{:03d}'.format(doy)
+    cyyyy = str(year)
+
+    filename = ''
+    checking = subprocess.call(['which','lftp'])
+    if (checking == 1):
+        print('I do not think you have lftp installed. gnssrefl will ')
+        print('not do this for you. Exiting.')
+        return filename, found
+               
+
+    # information for accessing GNET with appropriate filename
+    archive = 'gnet'
+    fdir = os.environ['REFL_CODE']
+
+    csrate = '{:02d}'.format(samplerate)
+    ch = '0000_01D_' + csrate + 'S_MO'
+
+    userinfo_file = fdir + '/Files/passwords/' + archive + '.pickle'
+    streamID = '_' + stream + '_'
+
+    serve = '@ftp.dataforsyningen.dk; cd /GNSS/RINEX3/GRL/'
+
+    # define file names
+    gfilename = station.upper() + streamID + cyyyy + cdoy + ch + '.crx.gz'
+    filename = station.upper() + streamID + cyyyy + cdoy + ch + '.crx'
+    rfilename = station.upper() + streamID + cyyyy + cdoy + ch + '.rnx'
+
+    if os.path.exists(gfilename):
+        print('File found ', gfilename)
+        #subprocess.call(['gunzip', gfilename])
+        return gfilename, True
+        #if os.path.exists(filename):
+        #    # decompress
+        #    subprocess.call([crnxpath, filename])
+        #    subprocess.call(['rm', filename])
+
+    #print('Will try to pick up BFG account information',userinfo_file)
+    if os.path.exists(userinfo_file):
+        with open(userinfo_file, 'rb') as client_info:
+            login_info = pickle.load(client_info)
+            user_id = login_info[0]
+            passport = login_info[1]
+            print('Looking for ', filename)
+            cd1 = 'lftp -c "open ftps://' + user_id + ':' + passport + serve + cyyyy + '/' + cdoy + '; get ' + gfilename + '"'
+            try:
+                subprocess.call(cd1,shell=True)
+                #if os.path.exists(gfilename):
+                #   subprocess.call(['gunzip', gfilename])
+                #if os.path.exists(filename):# decompress
+                #    subprocess.call([crnxpath, filename])
+            except:
+                print('something went wrong with access to GNET files')
+
+    if os.path.exists(gfilename):
+        found = True
+        # get rid of hatanaka compressed version
+        #subprocess.call(['rm', filename])
+
+    return gfilename, found
+
+
+def query_coordinate_file(station):
+    """
+    Returns a priori latitude, longitude, and ellipsoidal height from a local file
+    The file should be stored in $REFL_CODE/input/llh_local.txt
+    It has a simple structure. Each value is separated by spaces
+
+    station latitude longitude height
+
+    The station name is four characters long and the units of the other
+    three are degrees, degrees, and meters. Height is the ellipsoidal
+    height. Comments are allowed in this file using a percent sign. If you use
+    more or less than four columns per line the code will crash.
+
+    Parameters
+    -----------
+    station : str
+        4 character station name. checks both upper and lower case
+    
+    Returns
+    -------
+    foundit : bool
+        whether you found the coordinates
+    lat : float
+        latitude in degrees (zero if not found)
+    lon : float
+        longitude in degrees (zero if not found)
+    ht : float
+        ellipsoidal ht in meters (zero if not found)
+    """
+    xdir = os.environ['REFL_CODE']
+    f= xdir + '/input/llh_local.txt'
+    foundit = False
+    lat = 0; lon = 0; ht = 0;
+    # if the local coordinate file exists
+    if os.path.isfile(f):
+        allofit =np.loadtxt(f,usecols = (0,1,2,3), dtype='str',comments= '%')
+        nx = np.shape(allofit)
+        if len(nx) == 2:
+            nr = nx[0]; nc=nx[1]
+            for i in range(0,nr):
+                dbname = allofit[i,0].lower()
+                if (station.lower() == dbname):
+                    lat = float(allofit[i,1]);lon = float(allofit[i,2])
+                    ht =  float(allofit[i,3])
+                    print('Found in local coordinates file : ', lat,lon, ht)
+                    foundit = True
+        else: # annoying single line
+            if (allofit[0] == station.lower()):
+                foundit = True
+                lat=  float(allofit[1]) ; lon = float(allofit[2]) ; ht =  float(allofit[3])
+                print('Found in local coordinates file : ', lat,lon,ht)
+
+    return foundit, lat, lon, ht
 
